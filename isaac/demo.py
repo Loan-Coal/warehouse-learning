@@ -14,8 +14,18 @@ import traceback
 
 from isaacsim import SimulationApp
 
-HEADLESS = os.environ.get("DEMO_HEADLESS", "").strip() == "1"   # smoke tests without a window
-app = SimulationApp({"headless": HEADLESS})
+HEADLESS = os.environ.get("DEMO_HEADLESS", "").strip() == "1"
+
+# On utilise l'expérience standard mais on coupe les extensions dépréciées
+app_config = {
+    "headless": HEADLESS,
+    "settings": {
+        "/app/exts/fold/isaacsim.sensors.rtx": False,
+        "/exts/isaacsim.sensors.rtx/enabled": False,
+    }
+}
+
+app = SimulationApp(app_config)
 
 from env.layout import DEFAULT_MAP, maze_layout, random_layout  # noqa: E402
 from env.warehouse import Warehouse  # noqa: E402
