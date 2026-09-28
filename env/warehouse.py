@@ -45,6 +45,8 @@ class Warehouse:
             raise ValueError("invalid layout: " + "; ".join(found))
         if not 0.0 <= alpha <= 1.0 or not 0.0 <= task_prob <= 1.0:
             raise ValueError("alpha and task_prob must be in [0, 1]")
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
         self.width, self.height = len(self.grid[0]), len(self.grid)
         self.n_robots, self.max_steps, self.view_range = n_robots, max_steps, view_range
         self.alpha, self.task_prob = alpha, task_prob

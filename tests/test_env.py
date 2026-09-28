@@ -6,7 +6,7 @@ Run from the repo root: python -m unittest discover -s tests
 import random
 import unittest
 
-from env.layout import DEFAULT_MAP, parse, problems, random_layout
+from env.layout import DEFAULT_MAP, cells_of, maze_layout, parse, problems, random_layout
 from env.warehouse import Warehouse
 
 UP, DOWN, LEFT, RIGHT, WAIT, INTERACT = range(6)
@@ -308,6 +308,44 @@ class TestLayouts(unittest.TestCase):
             text = random_layout(seed)
             self.assertEqual(problems(parse(text), 2), [], text)
             self.assertEqual(text, random_layout(seed))
+
+    def test_mazes_are_valid_and_deterministic(self):
+        for seed in range(200):
+            text = maze_layout(seed)
+            grid = parse(text)
+            self.assertEqual((len(grid[0]), len(grid)), (11, 9))
+            self.assertEqual(problems(grid, 2), [], text)
+            self.assertEqual(text, maze_layout(seed))
+
+    def test_maze_docks_are_counted_and_spread_out(self):
+        for seed in range(50):
+            grid = parse(maze_layout(seed))
+            xs = [x for x, _ in cells_of(grid, "D")]
+            self.assertEqual(len(xs), 2, f"seed {seed}")
+            self.assertLessEqual(min(xs), 11 // 2, f"seed {seed}")    # one in each half of the bottom row
+            self.assertGreater(max(xs), 11 // 2, f"seed {seed}")
+        self.assertEqual(len(cells_of(parse(maze_layout(0, width=15, height=13, docks=3)), "D")), 3)
+        with self.assertRaises(ValueError):
+            maze_layout(0, docks=0)
+
+    def test_maze_size_is_a_parameter(self):
+        grid = parse(maze_layout(0, width=15, height=13, n_robots=4))
+        self.assertEqual((len(grid[0]), len(grid)), (15, 13))
+        self.assertEqual(problems(grid, 4), [])
+        for width, height in ((10, 9), (11, 8), (3, 9)):
+            with self.assertRaises(ValueError):
+                maze_layout(0, width=width, height=height)
+
+    def test_maze_corridors_are_one_cell_wide_with_loops(self):
+        for seed in range(50):
+            grid = parse(maze_layout(seed))
+            aisles = set(cells_of(grid, "."))
+            # No open 2x2 square anywhere: every corridor is one cell wide.
+            for x, y in aisles:
+                self.assertFalse({(x + 1, y), (x, y + 1), (x + 1, y + 1)} <= aisles, f"seed {seed}")
+            # A tree of n cells has n - 1 links; more links means at least one loop.
+            links = sum((x + 1, y) in aisles for x, y in aisles) + sum((x, y + 1) in aisles for x, y in aisles)
+            self.assertGreater(links, len(aisles) - 1, f"seed {seed}")
 
     def test_invalid_maps_are_rejected(self):
         with self.assertRaises(ValueError):

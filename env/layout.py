@@ -136,3 +136,76 @@ def random_layout(seed, width=None, height=None, n_robots=2):
         if not problems(parse(text), n_robots):
             return text
     raise ValueError(f"no valid layout found for seed={seed}, width={width}, height={height}")
+
+
+def maze_layout(seed, width=11, height=9, n_robots=2, loops=0.25, docks=2):
+    """A random maze of one-cell-wide aisles whose walls are shelves, validated for `n_robots`.
+
+    Aisle "rooms" sit on even (x, y); a random depth-first search opens the shelf between
+    neighbouring rooms, which gives a perfect maze. Then each remaining shelf between two
+    rooms is opened with probability `loops`, so robots can route around each other.
+    `docks` shelves on the bottom row become docks, one in each equal section of the row.
+    Width and height must be odd.
+    """
+    if width < 5 or height < 5 or width % 2 == 0 or height % 2 == 0:
+        raise ValueError(f"maze width and height must be odd and at least 5, got {width}x{height}")
+    if not 0 <= loops <= 1:
+        raise ValueError(f"loops must be in [0, 1], got {loops}")
+    if not 1 <= docks <= width // 2 // 2:
+        raise ValueError(f"docks must be between 1 and {width // 2 // 2} for width {width}, got {docks}")
+    rng = random.Random(seed)
+    for _ in range(100):
+        rows = _carve_maze(rng, width, height)
+        opened = _add_loops(rng, rows, loops)
+        # The shelves left on the bottom row each sit between two aisle rooms: dock candidates.
+        sections = [[x for x in range(1, width, 2) if rows[height - 1][x] == SHELF and x * docks // width == k]
+                    for k in range(docks)]
+        if not opened or not all(sections):
+            continue
+        for spots in sections:
+            rows[height - 1][rng.choice(spots)] = DOCK
+        text = "\n".join("".join(r) for r in rows)
+        if not problems(parse(text), n_robots):
+            return text
+    raise ValueError(f"no valid maze found for seed={seed}, width={width}, height={height}")
+
+
+def _carve_maze(rng, width, height):
+    """All shelves, with rooms on even cells joined into a perfect maze (iterative DFS)."""
+    rows = [[SHELF] * width for _ in range(height)]
+    start = (2 * rng.randrange(width // 2 + 1), 2 * rng.randrange(height // 2 + 1))
+    rows[start[1]][start[0]] = AISLE
+    stack = [start]
+    while stack:
+        x, y = stack[-1]
+        options = [(x + 2 * dx, y + 2 * dy, dx, dy) for dx, dy in DIRS
+                   if in_bounds(rows, x + 2 * dx, y + 2 * dy) and rows[y + 2 * dy][x + 2 * dx] == SHELF]
+        if not options:
+            stack.pop()
+            continue
+        nx, ny, dx, dy = rng.choice(options)
+        rows[y + dy][x + dx] = rows[ny][nx] = AISLE
+        stack.append((nx, ny))
+    return rows
+
+
+def _add_loops(rng, rows, loops):
+    """Open some shelves between two rooms; return how many were opened.
+
+    Also opens one wall next to any corner post (odd x and y) that no aisle touches, so
+    every shelf stays reachable. Posts themselves stay, so corridors stay one cell wide.
+    """
+    height, width = len(rows), len(rows[0])
+    walls = [(x, y) for y in range(height) for x in range(width) if (x + y) % 2 == 1 and rows[y][x] == SHELF]
+    opened = 0
+    for x, y in walls:
+        if rng.random() < loops:
+            rows[y][x] = AISLE
+            opened += 1
+    for y in range(1, height, 2):
+        for x in range(1, width, 2):
+            if not access_cells(rows, (x, y)):
+                wx, wy = rng.choice([(x + dx, y + dy) for dx, dy in DIRS if in_bounds(rows, x + dx, y + dy)])
+                rows[wy][wx] = AISLE
+                opened += 1
+    return opened

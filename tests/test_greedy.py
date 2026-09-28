@@ -1,7 +1,7 @@
 """The greedy baseline must actually deliver, alone and with company."""
 import unittest
 
-from env.layout import DEFAULT_MAP, random_layout
+from env.layout import DEFAULT_MAP, maze_layout, random_layout
 from env.warehouse import Warehouse
 from rl.policies.greedy import GreedyPolicy
 
@@ -29,6 +29,10 @@ class TestGreedy(unittest.TestCase):
     def test_random_layouts_deliver(self):
         for seed in range(5):
             self.assertGreaterEqual(deliveries(random_layout(seed), 2, seed), 1, f"seed {seed}")
+
+    def test_mazes_deliver(self):
+        for seed in range(5):
+            self.assertGreaterEqual(deliveries(maze_layout(seed), 2, seed), 1, f"seed {seed}")
 
     def test_is_reproducible_from_its_seed(self):
         grid = DEFAULT_MAP.strip().splitlines()

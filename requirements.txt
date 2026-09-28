@@ -1,6 +1,7 @@
 # Light environment (.venv): env/, rl/ and tests/ use the standard library only for now.
-# Add algorithm dependencies here (e.g. numpy). They must also install cleanly in
-# .venv-isaac, because isaac/demo.py runs the same policies.
+# Add algorithm dependencies here (e.g. numpy). They must also install cleanly in the
+# Isaac venv (C:\venvs\warehouse-isaac, which pins numpy 1.26.0 and torch 2.7.0),
+# because isaac/demo.py runs the same policies.
 #
 # Isaac Sim is deliberately NOT listed: it is a ~20 GB optional install for the viewer
 # only. See README.md, "Isaac Sim viewer".

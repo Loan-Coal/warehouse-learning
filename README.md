@@ -12,7 +12,7 @@ observation. The environment's task queue plays the warehouse management system 
 |---|---|---|---|
 | `env/` | shared contract | grid model: maps, dynamics, observation, reward, `get_state()` | stdlib only |
 | `rl/` | algorithm team | policies (`rl/policies/`) and the runner / training loop (`rl/run.py`) | `env` only, never Isaac |
-| `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with cubes | `env`, `rl.policies`, Isaac Sim |
+| `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with NVIDIA warehouse assets | `env`, `rl.policies`, Isaac Sim |
 | `tests/` | shared | guards the contract (`test_env.py`) and the baseline (`test_greedy.py`) | stdlib only |
 
 A change to `env/` that breaks a contract table below or `tests/test_env.py` affects both teams.
@@ -34,6 +34,7 @@ pip install -r requirements.txt
 python -m unittest discover -s tests               # all tests
 python -m rl.run                                   # one rendered episode on the default map
 python -m rl.run --random-map --seed 3             # a random warehouse
+python -m rl.run --maze --seed 3 --max-steps 200   # a random maze of racks (--size 15 13 for bigger)
 python -m rl.run --robots 4 --episodes 100 --no-render
 ```
 
@@ -59,7 +60,9 @@ sharing; separate objects give independent learners.
 
 **Map.** A multi-line string: `.` aisle, `S` shelf, `D` dock. Only aisles are walkable. A robot interacts
 with a shelf or dock from a 4-adjacent aisle cell. The default is 7x6. `random_layout(seed)` makes
-validated, warehouse-shaped maps.
+validated, warehouse-shaped maps. `maze_layout(seed, width=11, height=9, loops=0.25, docks=2)` makes a maze of
+one-cell-wide aisles walled by racks, with some loops so robots can route around each other, and docks
+spread along the bottom row (width and height must be odd).
 
 **Actions:** `0` up, `1` down, `2` left, `3` right, `4` wait, `5` interact (pick up at the pickup cell,
 drop off at the dropoff cell).
@@ -94,14 +97,44 @@ crates [{id, x, y, carried_by}], queue_len, step`.
 
 ## Isaac Sim viewer (optional, ~20 GB)
 
-Uses a separate venv, so the algorithm side stays light:
+Uses a separate venv, so the algorithm side stays light. **It must live at a short path outside the
+repo.** Isaac's own files reach ~200 characters inside the venv, and on Windows a long prefix makes its
+DLLs fail to load ("The filename or extension is too long"), even with long paths enabled.
 
 ```powershell
-py -3.11 -m venv .venv-isaac
-.\.venv-isaac\Scripts\python.exe -m pip install --upgrade pip
-.\.venv-isaac\Scripts\python.exe -m pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
-.\.venv-isaac\Scripts\Activate.ps1
+py -3.11 -m venv C:\venvs\warehouse-isaac
+C:\venvs\warehouse-isaac\Scripts\python.exe -m pip install --upgrade pip
+C:\venvs\warehouse-isaac\Scripts\python.exe -m pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
+C:\venvs\warehouse-isaac\Scripts\activate.bat      # cmd;  PowerShell: C:\venvs\warehouse-isaac\Scripts\Activate.ps1
 isaacsim        # first launch: accept the EULA and wait for the GUI (shader compile), then close it
 ```
 
-Running the demo is documented once `isaac/demo.py` exists.
+Then run Isaac scripts from the repo root with that venv active (`python -m isaac.<script>`).
+
+Isaac pins `numpy 1.26.0` and `torch 2.7.0`. Any algorithm dependency added to `requirements.txt`
+must be compatible, because the demo runs the same policies.
+
+### Running the 3D demo
+
+```
+C:\venvs\warehouse-isaac\Scripts\activate.bat
+cd <repo root>
+python -m isaac.demo
+```
+
+It shows the same episode as `python -m rl.run --maze --max-steps 200` (same maze, seed and policy),
+drawn with NVIDIA's warehouse assets at real scale: one grid cell is 4 m. Shelves are rack bays, docks are red floor pads, robots
+are forklifts with a coloured roof plate, and crates are pallets with boxes. A **Warehouse** window
+lists the totals and what each robot is doing. The first run downloads the assets and can take a
+while. The window stays open after the episode; close it to exit.
+
+The scene is built from the map string, so any valid layout works. To change what it shows, edit the
+block at the top of `isaac/demo.py`: `SEED`, `N_ROBOTS`, `MAX_STEPS`, `LAYOUT` (`maze_layout(...)`,
+`random_layout(...)` or `DEFAULT_MAP`), `FRAMES_PER_STEP` (the playback speed) and `make_policies`
+(the algorithm).
+
+Isaac is only for watching. Training runs in `.venv` with no rendering, at several thousand env steps
+per second.
+
+`isaac/scene.py` holds every asset path and measured size. It is the only file to change when swapping
+models.
