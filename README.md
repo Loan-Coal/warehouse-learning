@@ -11,11 +11,13 @@ observation. The environment's task queue plays the warehouse management system 
 | Folder | Owner | What | Dependencies |
 |---|---|---|---|
 | `env/` | shared contract | grid model: maps, dynamics, observation, reward, `get_state()` | stdlib only |
-| `rl/` | algorithm team | policies (`rl/policies/`) and the runner / training loop (`rl/run.py`) | `env` only, never Isaac |
+| `rl/` | algorithm team | policies (`rl/policies/`), their interface (`rl/policy.py`), the episode loop (`rl/loop.py`) and runner (`rl/run.py`) | `env` only, never Isaac |
 | `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with NVIDIA warehouse assets | `env`, `rl.policies`, Isaac Sim |
-| `tests/` | shared | guards the contract (`test_env.py`) and the baseline (`test_greedy.py`) | stdlib only |
+| `tests/` | shared | guards the contract (`test_env.py`), every registered policy (`test_policies.py`) and the baseline (`test_greedy.py`) | stdlib only |
 
-A change to `env/` that breaks a contract table below or `tests/test_env.py` affects both teams.
+A change to `env/` that breaks a contract table below or `tests/test_env.py` affects both teams. Any change to the
+observation, actions or rewards must also bump `CONTRACT_VERSION` in `env/warehouse.py`, so old checkpoints are refused
+instead of silently misbehaving.
 
 ## Setup (Windows, PowerShell, from the repo root)
 
@@ -36,25 +38,113 @@ python -m rl.run                                   # one rendered episode on the
 python -m rl.run --random-map --seed 3             # a random warehouse
 python -m rl.run --maze --seed 3 --max-steps 200   # a random maze of racks (--size 15 13 for bigger)
 python -m rl.run --robots 4 --episodes 100 --no-render
+python -m rl.run --help                            # every flag
 ```
 
 Always run from the repo root with `python -m`, so that `env` and `rl` can be imported.
 
-## Adding an algorithm
+## Writing an algorithm (guide for the algorithm team)
 
-Put a class in `rl/policies/` with this interface, then change `make_policies` in `rl/run.py`:
+You only ever touch two places: your own file in `rl/policies/`, and one import plus one line in
+`rl/policies/__init__.py`. You never need Isaac Sim, and you never edit `env/` (if you think you need to,
+talk to the team first: it changes the contract for everyone).
+
+### 1. Create your file
+
+Copy the template and rename it after your algorithm (the template is a small working tabular Q-learner):
+
+    copy rl\policies\_template.py rl\policies\myalgo.py
+
+Rename the class inside (`MyAlgo`), then pick the shape that matches your algorithm:
+
+| You are writing… | Subclass | Write | Register as |
+|---|---|---|---|
+| one rule every robot runs, one shared set of weights (parameter sharing) | `RobotPolicy` | `act_one(obs) -> int` | `shared(MyAlgo)` |
+| one rule per robot, each robot with its own weights (independent learners) | `RobotPolicy` | `act_one(obs) -> int` | `independent(MyAlgo)` |
+| one controller deciding for all robots at once (centralized, or CTDE like MAPPO/QMIX) | `Policy` | `act(obs_list) -> list[int]` | `MyAlgo` |
+
+Both base classes live in `rl/policy.py` (a short file, worth reading once).
+
+What you get:
+
+- `spec` in the constructor `(spec, seed)`: `spec.grid` (the map rows), `spec.n_robots`, `spec.n_actions` (6),
+  `spec.obs_size` (14).
+- `obs`: one robot's observation with named fields: `obs.x`, `obs.y`, `obs.carrying`, `obs.has_task`,
+  `obs.target_x`, `obs.target_y`, and the rays `obs.up_d`, `obs.up_t`, … `obs.right_t` (see Contract below);
+  `obs.rays()` gives the four `(distance, type)` pairs. It is also a plain tuple, so `np.array(obs)` or using it as
+  a dict key works.
+- Actions and ray types: import them, never type the numbers:
+  `from env.warehouse import UP, DOWN, LEFT, RIGHT, WAIT, INTERACT, ROBOT`.
+
+Methods (all optional except `act` / `act_one`). For a `RobotPolicy`, `update` is `update_one` and takes one
+robot's values instead of lists:
 
 ```python
-act(obs) -> int                                  # required
-update(obs, action, reward, next_obs, done)      # optional: called after every step
-reset()                                          # optional: called at every episode start
+act(obs_list) -> list[int]                                     # or act_one(obs) -> int
+update(obs_list, actions, rewards, next_obs_list, done)        # learners: called after every training step
+reset()                                                        # called at the start of every episode
+save(folder) / load(folder)                                    # learners: write / read your weights
 ```
 
-`make_policies` returns one policy per robot. Putting the same object in every slot gives parameter
-sharing; separate objects give independent learners.
+- `update` is **only** called with `--train`: never in evaluation or in the Isaac demo. Use `self.training`
+  (set by the runner) to switch exploration off when it is `False`, as the template does.
+- `done` is always a time-limit cut, never a real end state: keep bootstrapping from `next_obs`.
+- In `save`, write plain files into `folder` (JSON for tables, `torch.save(model.state_dict(), ...)` for networks),
+  never pickle the whole object. The runner writes `meta.json` next to them for you.
+- Libraries: the standard library for now. If you need numpy or torch, add exactly `numpy==1.26.0` or
+  `torch==2.7.0` to `requirements.txt` (the versions Isaac pins), because the Isaac demo runs your code too.
+  Ask before adding anything else.
 
-`done` is always a time-limit truncation: there is no terminal state, so keep bootstrapping from
-`next_obs`.
+### 2. Register it
+
+In `rl/policies/__init__.py`, add your import and one line:
+
+```python
+from rl.policies.myalgo import MyAlgo
+
+POLICIES = {
+    "greedy": shared(GreedyRule),
+    "myalgo": shared(MyAlgo),          # <- yours
+}
+```
+
+### 3. Test it
+
+    python -m unittest discover -s tests
+
+`tests/test_policies.py` automatically runs every registered policy on a small maze with 3 robots, in training
+and evaluation mode, and checks that `save` then `load` restores everything. A failure names your policy.
+
+### 4. Train and evaluate
+
+    python -m rl.run --policy myalgo --train --episodes 5000 --no-render --save checkpoints/myalgo
+    python -m rl.run --policy myalgo --checkpoint checkpoints/myalgo --episodes 100 --no-render
+    python -m rl.run --policy myalgo --checkpoint checkpoints/myalgo --maze --max-steps 200
+
+The first command trains and saves, the second evaluates without learning, the third shows one episode in the
+terminal. Use the same map flags (`--maze`, `--robots`, …) for training and evaluation. Compare against the
+baseline with `--policy greedy`. `checkpoints/` is not committed: share a checkpoint by sending the folder.
+
+### 5. Watch it in Isaac Sim (whoever has the Isaac venv)
+
+Put the checkpoint folder in `checkpoints/` of the repo on the Isaac machine, then:
+
+    C:\venvs\warehouse-isaac\Scripts\activate.bat
+    python -m isaac.demo --policy myalgo --checkpoint checkpoints/myalgo --maze --max-steps 200
+
+With the same flags it shows exactly the same episode as `rl.run`.
+
+### When things go wrong
+
+| Message | Meaning |
+|---|---|
+| `unknown policy 'x'` | you skipped step 2, or the name differs from the key in `POLICIES` |
+| `need N actions, each an int in 0..5` | your `act` returned the wrong number of actions, or something that is not an action |
+| `checkpoint was trained on contract v1, env is v2` | the observation, actions or rewards changed since you trained: retrain |
+| `checkpoint is for policy 'a', not 'b'` | `--checkpoint` points at another algorithm's folder |
+| `checkpoint has weights for 4 independent robots, the env has 2` | independent learners need the same `--robots` as in training (shared ones don't) |
+| `checkpoint ... has no q.json` | the registry entry (`shared`/`independent`) or your `save` changed since that checkpoint was made |
+| `ModuleNotFoundError: No module named 'env'` | run from the repo root with `python -m ...` |
 
 ## Contract
 
@@ -119,7 +209,7 @@ must be compatible, because the demo runs the same policies.
 ```
 C:\venvs\warehouse-isaac\Scripts\activate.bat
 cd <repo root>
-python -m isaac.demo
+python -m isaac.demo --maze --max-steps 200
 ```
 
 It shows the same episode as `python -m rl.run --maze --max-steps 200` (same maze, seed and policy),
@@ -128,10 +218,10 @@ are forklifts with a coloured roof plate, and crates are pallets with boxes. A *
 lists the totals and what each robot is doing. The first run downloads the assets and can take a
 while. The window stays open after the episode; close it to exit.
 
-The scene is built from the map string, so any valid layout works. To change what it shows, edit the
-block at the top of `isaac/demo.py`: `SEED`, `N_ROBOTS`, `MAX_STEPS`, `LAYOUT` (`maze_layout(...)`,
-`random_layout(...)` or `DEFAULT_MAP`), `FRAMES_PER_STEP` (the playback speed) and `make_policies`
-(the algorithm).
+The scene is built from the map string, so any valid layout works. The demo takes the same flags as
+`rl.run` (`--policy`, `--checkpoint`, `--seed`, `--robots`, `--maze`, `--random-map`, `--size`, `--max-steps`),
+plus `--frames-per-step` (playback speed, default 20) and `--headless`. To watch a trained algorithm, see step 5
+of "Writing an algorithm". Nobody needs to edit `isaac/demo.py` to change what it shows.
 
 Isaac is only for watching. Training runs in `.venv` with no rendering, at several thousand env steps
 per second.
