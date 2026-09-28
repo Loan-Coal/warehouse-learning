@@ -7,9 +7,7 @@ import random
 import unittest
 
 from env.layout import DEFAULT_MAP, cells_of, maze_layout, parse, problems, random_layout
-from env.warehouse import Warehouse
-
-UP, DOWN, LEFT, RIGHT, WAIT, INTERACT = range(6)
+from env.warehouse import CONTRACT_VERSION, DOWN, INTERACT, LEFT, RIGHT, UP, WAIT, Obs, Warehouse
 
 # Open rows on top so robots can be lined up freely; the bottom row makes the map valid.
 OPEN_MAP = """
@@ -352,6 +350,20 @@ class TestLayouts(unittest.TestCase):
             Warehouse("...\n.X.\nSD.")
         with self.assertRaises(ValueError):
             Warehouse("SSS\nS.S\nSDS")  # one aisle cell, and the shelf corners are unreachable
+
+
+class TestContractVersion(unittest.TestCase):
+    def test_obs_fields_are_pinned_to_the_contract_version(self):
+        # If this fails you changed the observation: update the README table, bump
+        # CONTRACT_VERSION in env/warehouse.py, then update this expectation.
+        fields = ("x", "y", "carrying", "has_task", "target_x", "target_y", "up_d", "up_t",
+                  "down_d", "down_t", "left_d", "left_t", "right_d", "right_t")
+        self.assertEqual((CONTRACT_VERSION, Obs._fields), (1, fields))
+
+    def test_obs_is_still_a_plain_tuple(self):
+        obs = Warehouse().reset(0)[0]
+        self.assertIsInstance(obs, tuple)
+        self.assertEqual(obs[4:6], (obs.target_x, obs.target_y))
 
 
 if __name__ == "__main__":

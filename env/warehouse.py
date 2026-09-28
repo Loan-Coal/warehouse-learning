@@ -7,16 +7,57 @@ Isaac sides; tests/test_env.py guards them.
 """
 import random
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from env.layout import AISLE, DEFAULT_MAP, DIRS, DOCK, SHELF, cells_of, in_bounds, parse, problems
 
+# Bump on any change to Obs, the actions or the rewards: checkpoints trained on another
+# version are refused, because their weights no longer mean anything.
+CONTRACT_VERSION = 1
+
 N_ACTIONS = 6
-WAIT, INTERACT = 4, 5
+UP, DOWN, LEFT, RIGHT, WAIT, INTERACT = range(N_ACTIONS)   # UP..RIGHT follow DIRS
 
 # Ray hit types in the observation.
 NOTHING, WALL, EMPTY_SHELF, FULL_SHELF, DOCK_HIT, ROBOT = range(6)
 
 R_DELIVERY, R_STEP, R_BLOCKED, R_INVALID = 10.0, -0.05, -1.0, -0.1
+
+
+class Obs(NamedTuple):
+    """One robot's observation. Still a flat tuple of ints: np.array(obs) and dict keys work."""
+    x: int
+    y: int
+    carrying: int
+    has_task: int
+    target_x: int     # pickup cell if not carrying, else dropoff cell; own cell if idle
+    target_y: int
+    up_d: int         # per direction: distance to the first thing seen (0 if nothing in range)
+    up_t: int         # ... and its type (NOTHING, WALL, EMPTY_SHELF, FULL_SHELF, DOCK_HIT, ROBOT)
+    down_d: int
+    down_t: int
+    left_d: int
+    left_t: int
+    right_d: int
+    right_t: int
+
+    def rays(self):
+        """((distance, type), ...) for up, down, left, right, in DIRS order."""
+        return ((self.up_d, self.up_t), (self.down_d, self.down_t),
+                (self.left_d, self.left_t), (self.right_d, self.right_t))
+
+
+OBS_SIZE = len(Obs._fields)
+
+
+@dataclass(frozen=True)
+class EnvSpec:
+    """Everything a policy may know about the env before the first step."""
+    grid: tuple           # the map rows; robots know the building, not where the others are
+    n_robots: int
+    n_actions: int = N_ACTIONS
+    obs_size: int = OBS_SIZE
+    contract_version: int = CONTRACT_VERSION
 
 
 @dataclass(frozen=True)
@@ -54,6 +95,10 @@ class Warehouse:
         self.reset()
 
     # ------------------------------------------------------------------ API
+
+    @property
+    def spec(self):
+        return EnvSpec(self.grid, self.n_robots)
 
     def reset(self, seed=None):
         self.rng = random.Random(seed)
@@ -248,8 +293,8 @@ class Warehouse:
         else:
             target = r.task.dropoff if r.crate is not None else r.task.pickup
         rays = [v for ray in self._rays(r) for v in ray]
-        return (r.pos[0], r.pos[1], int(r.crate is not None), int(r.task is not None),
-                target[0], target[1], *rays)
+        return Obs(r.pos[0], r.pos[1], int(r.crate is not None), int(r.task is not None),
+                   target[0], target[1], *rays)
 
     def _rays(self, robot):
         """(distance, type) of the first thing seen up, down, left, right; (0, 0) if nothing."""
