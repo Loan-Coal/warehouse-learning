@@ -5,3 +5,9 @@
 #
 # Isaac Sim is deliberately NOT listed: it is a ~20 GB optional install for the viewer
 # only. See README.md, "Isaac Sim viewer".
+
+# Charts for rl.plot / rl.bench (same version the Isaac venv ships).
+matplotlib==3.10.3
+
+# Neural networks (rl/policies/central_dqn.py). The exact version Isaac ships.
+torch==2.7.0

@@ -32,6 +32,8 @@ CRATE_ON_SHELF_Z = SHELF_LEVELS[0] + 0.025
 FORK_LOAD = np.array([0.0, -1.1, 0.1])  # pallet on the forks, in forklift coordinates
 DOCK_SIZE = 3.2                         # dock pad drawn inside its 4 m cell
 MARGIN = 2.0                            # floor/walls this far beyond the outer cell edges
+HUMAN_RADIUS, HUMAN_HEIGHT = 0.35, 1.8  # humans are simple capsules (no character asset needed)
+HUMAN_COLOR = (0.95, 0.75, 0.1)         # safety-vest yellow
 
 ROBOT_COLORS = [("orange", (1.0, 0.45, 0.0)), ("blue", (0.1, 0.4, 1.0)), ("green", (0.1, 0.8, 0.2)),
                 ("purple", (0.6, 0.2, 0.9)), ("red", (0.9, 0.1, 0.1)), ("yellow", (0.95, 0.85, 0.1)),
@@ -75,11 +77,16 @@ class WarehouseScene:
             self._forklift(i)
         for k in range(self.pool_size):
             self._crate(k)
+        self.n_humans = len(state.get("humans", []))
+        for k in range(self.n_humans):
+            self._human(k)
 
         self.robots = XFormPrim([f"/World/Robots/robot_{i}" for i in range(self.n_robots)])
         self.crates = XFormPrim([f"/World/Crates/crate_{k}" for k in range(self.pool_size)])
         self.crates.set_visibilities([False] * self.pool_size)
         self.slot_of = {}   # crate id -> pool slot; slots are freed when a crate leaves
+        if self.n_humans:
+            self.humans = XFormPrim([f"/World/Humans/human_{k}" for k in range(self.n_humans)])
 
         centre = (lo + hi) / 2
         self.overview = (np.array([centre[0], lo[1] - 0.6 * (hi[1] - lo[1]), 0.9 * max(hi - lo)]),
@@ -87,12 +94,14 @@ class WarehouseScene:
 
     # ---------------------------------------------------------------- per frame
 
-    def show(self, robot_xy, robot_yaw, crates):
+    def show(self, robot_xy, robot_yaw, crates, humans_xy=()):
         """robot_xy: world (x, y) per robot. crates: list of (id, pose or None to hide), where
-        pose is (position, yaw)."""
+        pose is (position, yaw). humans_xy: world (x, y) per human."""
         positions = [(x, y, 0.0) for x, y in robot_xy]
         self.robots.set_world_poses(positions=np.array(positions),
                                     orientations=np.array([yaw_quat(a) for a in robot_yaw]))
+        if self.n_humans:
+            self.humans.set_world_poses(positions=np.array([(x, y, 0.0) for x, y in humans_xy]))
         for cid, pose in crates:
             if pose is None:
                 if cid in self.slot_of:
@@ -207,3 +216,14 @@ class WarehouseScene:
         self._add(f"{path}/pallet", PALLET, (0.0, 0.0, 0.0))
         for j, (y, z) in enumerate([(-0.25, 0.211), (0.25, 0.211), (-0.25, 0.711), (0.25, 0.711)]):
             self._add(f"{path}/box_{j}", BOX, (0.0, y, z))
+
+    def _human(self, k):
+        # A standing capsule: USD capsules grow along Z around their centre, so lift it by half.
+        path = f"/World/Humans/human_{k}"
+        prims.create_prim(path)
+        body = UsdGeom.Capsule.Define(stage.get_current_stage(), f"{path}/body")
+        body.CreateRadiusAttr(HUMAN_RADIUS)
+        body.CreateHeightAttr(HUMAN_HEIGHT - 2 * HUMAN_RADIUS)
+        UsdGeom.XformCommonAPI(body).SetTranslate(Gf.Vec3d(0.0, 0.0, HUMAN_HEIGHT / 2))
+        paint = PreviewSurface(f"/World/Looks/human_{k}", color=np.array(HUMAN_COLOR), roughness=0.6)
+        UsdShade.MaterialBindingAPI.Apply(body.GetPrim()).Bind(paint.material)

@@ -2,82 +2,85 @@
 
     python -m rl.run                                              # one rendered episode, greedy, default map
     python -m rl.run --maze --seed 3 --max-steps 200              # a random maze of racks
-    python -m rl.run --policy myalgo --train --episodes 5000 --no-render --save checkpoints/myalgo
-    python -m rl.run --policy myalgo --checkpoint checkpoints/myalgo --episodes 100 --no-render
+    python -m rl.run --scenario hard                              # a preset of flags (env/scenarios.py)
+    python -m rl.run --policy myalgo --train --episodes 5000 --no-render --save checkpoints/myalgo --snapshot-every 500
+    python -m rl.run --checkpoint checkpoints/myalgo --episodes 100 --no-render    # evaluate, same settings as training
+    python -m rl.plot checkpoints/myalgo                          # learning curve of that training run
 
+Training with --save writes FOLDER/train_log.csv (one row per episode) and, with
+--snapshot-every N, a replayable checkpoint FOLDER/ep_000500/ every N episodes.
 isaac/demo.py takes the same flags, so both show the same episode.
 """
-import argparse
+import csv
 import time
+from pathlib import Path
 
-from env.layout import DEFAULT_MAP, maze_layout, random_layout
-from env.warehouse import Warehouse
-from rl.checkpoint import load_checkpoint, save_checkpoint
+from rl.checkpoint import save_checkpoint
+from rl.cli import build_or_exit, env_args, layout_for, make_parser, parse
 from rl.loop import run_episode
-from rl.policies import POLICIES
 
-
-def add_common_args(parser):
-    """Flags shared with isaac/demo.py: which env and which policy."""
-    parser.add_argument("--policy", default="greedy", help=f"one of: {', '.join(POLICIES)}")
-    parser.add_argument("--checkpoint", metavar="FOLDER", help="load trained weights before running")
-    parser.add_argument("--seed", type=int, default=0, help="episode k uses seed + k")
-    parser.add_argument("--robots", type=int, default=2)
-    maps = parser.add_mutually_exclusive_group()
-    maps.add_argument("--random-map", action="store_true", help="random warehouse from --seed")
-    maps.add_argument("--maze", action="store_true", help="random maze of racks from --seed")
-    parser.add_argument("--size", type=int, nargs=2, default=(11, 9), metavar=("W", "H"),
-                        help="maze width and height, both odd (default 11 9)")
-    parser.add_argument("--max-steps", type=int, default=100, help="episode length")
-
-
-def build(parser, args):
-    """(env, policy) from the common flags; bad flags end in a parser error, not a traceback."""
-    if args.policy not in POLICIES:
-        parser.error(f"unknown policy '{args.policy}'; registered in rl/policies/__init__.py: "
-                     f"{', '.join(POLICIES)}")
-    try:
-        if args.maze:
-            layout = maze_layout(args.seed, *args.size, n_robots=args.robots)
-        elif args.random_map:
-            layout = random_layout(args.seed, n_robots=args.robots)
-        else:
-            layout = DEFAULT_MAP
-        env = Warehouse(layout, n_robots=args.robots, max_steps=args.max_steps)
-        policy = POLICIES[args.policy](env.spec, args.seed)
-        if args.checkpoint:
-            load_checkpoint(policy, args.checkpoint, args.policy)
-    except ValueError as err:
-        parser.error(str(err))
-    return env, policy
+LOG_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return")
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    add_common_args(parser)
+    parser = make_parser(__doc__)
     parser.add_argument("--train", action="store_true", help="call the policy's update() after each step")
-    parser.add_argument("--save", metavar="FOLDER", help="with --train: write a checkpoint at the end")
+    parser.add_argument("--save", metavar="FOLDER", help="with --train: checkpoint + train_log.csv go here")
+    parser.add_argument("--snapshot-every", type=int, default=0, metavar="N",
+                        help="with --save: also keep a checkpoint every N episodes, to replay later")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--print-every", type=int, default=1, metavar="N", help="print every N-th episode")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--delay", type=float, default=0.15, help="seconds between rendered steps")
-    args = parser.parse_args()
-    if args.episodes < 1:
-        parser.error("--episodes must be at least 1")
+    args = parse(parser)
+    if args.episodes < 1 or args.print_every < 1 or args.snapshot_every < 0:
+        parser.error("--episodes and --print-every must be at least 1, --snapshot-every at least 0")
     if args.save and not args.train:
         parser.error("--save only makes sense with --train")
-    env, policy = build(parser, args)
+    if args.snapshot_every and not args.save:
+        parser.error("--snapshot-every needs --save")
+    env, policy = build_or_exit(parser, args)
 
     def show(*_):
         print(env.render() + "\n")
         time.sleep(args.delay)
 
+    log = TrainLog(args.save) if args.save else None
     for k in range(args.episodes):
-        stats = run_episode(env, policy, args.seed + k, args.train, None if args.no_render else show)
-        print(f"episode {k}: deliveries {stats['deliveries']}  blocked {stats['blocked']}  "
-              f"invalid {stats['invalid']}  mean return {stats['mean_return']:.2f}")
+        try:
+            layout = layout_for(args, k) if args.new_map else None
+        except ValueError as err:
+            parser.error(str(err))
+        stats = run_episode(env, policy, args.seed + k, args.train, None if args.no_render else show, layout)
+        if log:
+            log.write(k, stats)
+        if (k + 1) % args.print_every == 0 or k == args.episodes - 1:
+            print(f"episode {k}: deliveries {stats['deliveries']}  value {stats['value']:.1f}  "
+                  f"blocked {stats['blocked']}  invalid {stats['invalid']}  mean return {stats['mean_return']:.2f}")
+        if args.snapshot_every and (k + 1) % args.snapshot_every == 0:
+            save_checkpoint(policy, Path(args.save) / f"ep_{k + 1:06d}", args.policy, env.n_robots,
+                            env_args(args), episode=k + 1)
+    if log:
+        log.close()
     if args.save:
-        save_checkpoint(policy, args.save, args.policy, env.n_robots)
+        save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args), episode=args.episodes)
         print(f"saved checkpoint to {args.save}")
+
+
+class TrainLog:
+    """FOLDER/train_log.csv: one row per training episode, for rl.plot."""
+
+    def __init__(self, folder):
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        self.file = open(Path(folder) / "train_log.csv", "w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(LOG_FIELDS)
+
+    def write(self, episode, stats):
+        self.writer.writerow([episode] + [round(stats[k], 4) for k in LOG_FIELDS[1:]])
+
+    def close(self):
+        self.file.close()
 
 
 if __name__ == "__main__":

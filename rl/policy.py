@@ -11,14 +11,23 @@ Two shapes, pick one:
 Every constructor takes (spec, seed): spec is an env.warehouse.EnvSpec. The runner sets
 `training` to True while training and False in evaluation and in the Isaac demo; update()
 is only called while training.
+
+OBS lists what the robots observe (feature groups from env/observation.py); the env builds
+exactly that for your algorithm, and the checkpoint remembers it. `self.spec` is refreshed
+before every episode, so with --new-map spec.grid is always the current map.
 """
 from pathlib import Path
 
-from env.warehouse import EnvSpec, Obs
+from env.observation import DEFAULT_OBS
+from env.warehouse import EnvSpec
+
+Obs = tuple     # a namedtuple whose fields are the OBS groups' fields, e.g. obs.x, obs.front_t
 
 
 class Policy:
     """Decides for all robots at once. Subclass it for a centralized controller."""
+
+    OBS = DEFAULT_OBS
 
     def __init__(self, spec: EnvSpec, seed: int = 0):
         self.spec, self.seed = spec, seed
@@ -44,6 +53,8 @@ class Policy:
 class RobotPolicy:
     """Decides for one robot. Same methods as Policy, but for a single robot's data."""
 
+    OBS = DEFAULT_OBS
+
     def __init__(self, spec: EnvSpec, seed: int = 0):
         self.spec, self.seed = spec, seed
         self.training = False
@@ -66,12 +77,19 @@ class RobotPolicy:
 
 def shared(robot_cls):
     """Registry entry: one robot_cls instance acts for every robot (parameter sharing)."""
-    return lambda spec, seed=0: _PerRobot(robot_cls, spec, seed, shared=True)
+    return _factory(robot_cls, shared=True)
 
 
 def independent(robot_cls):
     """Registry entry: one robot_cls instance per robot, each learning on its own."""
-    return lambda spec, seed=0: _PerRobot(robot_cls, spec, seed, shared=False)
+    return _factory(robot_cls, shared=False)
+
+
+def _factory(robot_cls, shared):
+    def make(spec, seed=0):
+        return _PerRobot(robot_cls, spec, seed, shared)
+    make.OBS = robot_cls.OBS    # every registry entry exposes OBS, like a Policy class does
+    return make
 
 
 class _PerRobot(Policy):
@@ -86,6 +104,16 @@ class _PerRobot(Policy):
         else:
             self.distinct = [robot_cls(spec, seed + i) for i in range(spec.n_robots)]
             self.robots = self.distinct
+
+    @property
+    def spec(self):
+        return self._spec
+
+    @spec.setter
+    def spec(self, spec):
+        self._spec = spec
+        for robot in getattr(self, "distinct", []):
+            robot.spec = spec
 
     @property
     def training(self):
