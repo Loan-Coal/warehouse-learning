@@ -2,15 +2,17 @@
 import operator
 
 
-def run_episode(env, policy, seed, train, on_step=None):
+def run_episode(env, policy, seed, train, on_step=None, layout=None):
     """Play one episode; returns env.totals plus mean_return.
 
     train: call policy.update after each step (and set policy.training).
     on_step(obs, actions, next_obs, info): called after each step, e.g. to draw it;
     returning True stops the episode early.
+    layout: a new map string for this episode (None keeps the current map).
     """
     policy.training = train
-    obs = env.reset(seed)
+    obs = env.reset(seed, layout)
+    policy.spec = env.spec      # the map may have changed
     policy.reset()
     returns = [0.0] * env.n_robots
     done = False

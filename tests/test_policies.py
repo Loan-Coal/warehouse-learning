@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from env.layout import maze_layout
-from env.warehouse import N_ACTIONS, Warehouse
+from env.warehouse import N_ACTIONS, TURN_RIGHT, Warehouse
 from rl.checkpoint import load_checkpoint, save_checkpoint
 from rl.loop import run_episode
 from rl.policies import POLICIES
@@ -20,8 +20,8 @@ CANDIDATES = dict(POLICIES, template_shared=shared(MyAlgo), template_independent
 STEPS, ROBOTS = 20, 3
 
 
-def small_env():
-    return Warehouse(maze_layout(0, n_robots=ROBOTS), n_robots=ROBOTS, max_steps=STEPS)
+def small_env(obs=MyAlgo.OBS, **factors):
+    return Warehouse(maze_layout(0, n_robots=ROBOTS), n_robots=ROBOTS, max_steps=STEPS, obs=obs, **factors)
 
 
 def files(folder):
@@ -32,7 +32,8 @@ class TestEveryPolicy(unittest.TestCase):
     def test_plays_in_train_and_eval_mode(self):
         for name, make in CANDIDATES.items():
             with self.subTest(policy=name):
-                env = small_env()
+                # Every factor on: a policy must cope with any scenario, even if it plays badly.
+                env = small_env(make.OBS, mixed_crates=True, mixed_robots=True, priority=True, humans=2)
                 policy = make(env.spec, 0)
                 self.assertIsInstance(policy, Policy)
                 for train in (True, False):
@@ -47,7 +48,7 @@ class TestEveryPolicy(unittest.TestCase):
         # save -> load -> save must write the same files: load restores everything save wrote.
         for name, make in CANDIDATES.items():
             with self.subTest(policy=name), tempfile.TemporaryDirectory() as tmp:
-                env = small_env()
+                env = small_env(make.OBS)
                 trained = make(env.spec, 0)
                 run_episode(env, trained, 0, train=True)
                 first, second = Path(tmp, "first"), Path(tmp, "second")
@@ -59,7 +60,7 @@ class TestEveryPolicy(unittest.TestCase):
 
 
 class Recorder(RobotPolicy):
-    """Waits, and records what the loop did to it."""
+    """Turns in place, and records what the loop did to it."""
 
     def __init__(self, spec, seed=0):
         super().__init__(spec, seed)
@@ -67,7 +68,7 @@ class Recorder(RobotPolicy):
 
     def act_one(self, obs):
         self.flags.add(self.training)
-        return 4
+        return TURN_RIGHT
 
     def update_one(self, *step):
         self.updates += 1
@@ -77,7 +78,7 @@ class NumpyLikeInt:
     """Behaves like np.int64: usable as an index, but not an int subclass."""
 
     def __index__(self):
-        return 4
+        return TURN_RIGHT
 
 
 class TestPlumbing(unittest.TestCase):
@@ -122,6 +123,19 @@ class TestPlumbing(unittest.TestCase):
                 load_checkpoint(policy, tmp, "recorder")
             with self.assertRaisesRegex(ValueError, "not a checkpoint"):
                 load_checkpoint(policy, Path(tmp, "missing"), "recorder")
+
+    def test_checkpoint_with_other_obs_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save_checkpoint(shared(Recorder)(small_env().spec), tmp, "recorder", ROBOTS)
+            other = small_env(obs=("position", "rays"))
+            with self.assertRaisesRegex(ValueError, "trained with OBS"):
+                load_checkpoint(shared(Recorder)(other.spec), tmp, "recorder")
+
+    def test_spec_follows_a_new_map(self):
+        env = small_env()
+        policy = independent(Recorder)(env.spec)
+        run_episode(env, policy, 0, train=False, layout=maze_layout(5, 13, 11, n_robots=ROBOTS))
+        self.assertEqual(len(policy.distinct[1].spec.grid), 11)
 
     def test_independent_checkpoint_needs_the_same_robot_count(self):
         env, bigger = small_env(), Warehouse(maze_layout(0, n_robots=4), n_robots=4)
