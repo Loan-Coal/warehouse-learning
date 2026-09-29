@@ -158,6 +158,50 @@ class TestBatchedPolicyDefault(unittest.TestCase):
         self.assertEqual(seen, [(ROBOTS, False), (ROBOTS, True)])
 
 
+class TestEvaluationDoesNotLeak(unittest.TestCase):
+    """rl.run.evaluate plays on its own env and its own held-out map, via run_episode -- which
+    sets policy.spec and policy.training and does not put them back.
+
+    The vectorised loop sets them once per round rather than once per episode, so anything left
+    behind survives until the next round. The policy then builds its action masks from the
+    EVALUATION maze while acting in the training ones, and spends a whole round playing illegal
+    moves. Nothing raises. It was visible only as a spike in the invalid column of the chart.
+    """
+
+    def test_training_resumes_on_the_training_map_after_an_evaluation(self):
+        args = settings("--train", "--envs", "4", "--episodes", "8", "--eval-every", "4",
+                        "--eval-episodes", "2")
+        env, policy = build(args)
+        seen = []
+
+        def evaluate(episode):
+            # What rl.run.evaluate does to the policy, without needing the whole of rl.run.
+            other = make_env(args, env.spec.obs_features, maze_layout(777, 11, 9, n_robots=ROBOTS))
+            run_episode(other, policy, 90_000, train=False)
+            seen.append(policy.spec.grid)
+
+        train_vec(args, env, policy, None, evaluate)
+        self.assertTrue(seen, "the evaluation hook never ran")
+        self.assertNotEqual(seen[0], env.grid, "the evaluation should be on another map")
+        self.assertEqual(policy.spec.grid, env.grid, "the policy is still on the evaluation map")
+        self.assertIs(policy.training, True, "training was left switched off after an evaluation")
+
+    def test_no_invalid_actions_survive_an_evaluation(self):
+        """The symptom the bug actually produced, end to end, with a policy that masks."""
+        args = settings("--policy", "central_dqn", "--train", "--envs", "2", "--episodes", "6",
+                        "--eval-every", "2", "--eval-episodes", "1")
+        env, policy = build(args)
+        rows = []
+
+        def evaluate(episode):
+            other = make_env(args, env.spec.obs_features, maze_layout(555, 11, 9, n_robots=ROBOTS))
+            run_episode(other, policy, 90_000, train=False)
+
+        train_vec(args, env, policy, _Collector(rows), evaluate)
+        worst = max(row["invalid"] for row in rows)
+        self.assertEqual(worst, 0, f"a training episode played {worst} illegal moves after an eval")
+
+
 class TestEpisodeMilestones(unittest.TestCase):
     """With N envs the episode count jumps by N, so "every N-th" cannot be an equality test."""
 

@@ -61,6 +61,14 @@ def train_vec(args, env, policy, log, evaluate):
         _report(args, vec, stats, started)
         if _crossed(before, vec.finished, args.eval_every):
             evaluate(vec.finished)
+            # evaluate() plays on its own env, on its own held-out map, through run_episode --
+            # which sets policy.spec and policy.training and does not put them back. Leaving
+            # them is not a crash: the policy simply builds its action masks from the evaluation
+            # maze for a whole training round, and plays hundreds of illegal moves it is fined
+            # for. It showed up only as a spike in the invalid column of the learning curve.
+            policy.spec = envs[0].spec
+            policy.training = args.train
+            policy.reset()
         if _crossed(before, vec.finished, args.snapshot_every):
             save_checkpoint(policy, f"{args.save}/ep_{vec.finished:06d}", args.policy,
                             env.n_robots, env_args(args), episode=vec.finished,
