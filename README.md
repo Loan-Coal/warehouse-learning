@@ -88,34 +88,37 @@ A **scenario** is a named preset of these flags, in `env/scenarios.py`: `basic`,
 navigator and a fair bar for a learned policy. **Lead with deliveries and invalid.** `mean_return` is a poor
 headline: it has a hard floor of `max_steps × -0.05` whatever the policy does.
 
-Measured with 20 episodes on seeds 90000-90019 (`hard` = 11x9 maze, 4 robots, 200 steps; `big` = 21x21,
-6 robots, 400 steps; every complexity factor on):
+`hard` = 11x9 maze, 4 robots, 200 steps; `big` = 21x21, 6 robots, 400 steps; every complexity factor on.
+**Quote the 100-episode rows.** The 20-episode ones are kept only to show why:
 
-| policy | scenario | maps | deliveries | blocked | invalid | mean_return |
-|---|---|---|---|---|---|---|
-| greedy | hard | one fixed maze | 5.60 ± 2.82 | 9.20 | 19.35 | -0.75 |
-| greedy | hard | **20 held-out mazes** | **5.00 ± 3.51** | 11.95 | 34.05 | -2.58 |
-| greedy | big | one fixed maze | 12.30 ± 4.11 | 20.15 | 26.60 | -10.20 |
-| greedy | big | **20 held-out mazes** | **10.65 ± 4.16** | 16.50 | 32.05 | -11.67 |
-| greedy | big | 100 held-out mazes | 10.61 ± 4.35 | 20.20 | 30.75 | -12.33 |
+| policy | scenario | maps | episodes | deliveries | blocked | invalid | mean_return |
+|---|---|---|---|---|---|---|---|
+| greedy | hard | one fixed maze | 20 | 5.60 ± 2.82 | 9.20 | 19.35 | -0.75 |
+| greedy | hard | held-out mazes | 20 | 5.00 ± 3.51 | 11.95 | 34.05 | -2.58 |
+| **greedy** | **hard** | **held-out mazes** | **100** | **6.23 ± 3.36** | **11.52** | **24.68** | **+0.79** |
+| greedy | big | one fixed maze | 20 | 12.30 ± 4.11 | 20.15 | 26.60 | -10.20 |
+| greedy | big | held-out mazes | 20 | 10.65 ± 4.16 | 16.50 | 32.05 | -11.67 |
+| **greedy** | **big** | **held-out mazes** | **100** | **10.61 ± 4.35** | **20.20** | **30.75** | **-12.33** |
 
 ```powershell
 # the bar a learned policy has to clear, on the same maps rl.run evaluates on
-python -m rl.bench greedy --scenarios hard big --episodes 20 --seed 90000 --new-map --out results/greedy_random
+python -m rl.bench greedy --scenarios hard big --episodes 100 --seed 90000 --new-map --out results/greedy_random
 # the same maps a single-maze measurement would have used, for comparison
-python -m rl.bench greedy --scenarios hard big --episodes 20 --seed 90000 --out results/greedy_fixed
+python -m rl.bench greedy --scenarios hard big --episodes 100 --seed 90000 --out results/greedy_fixed
 ```
 
-Two things to know before quoting any of this:
+Three things to know before quoting any of this:
 
-- **Randomising the maze costs greedy about 12%** (5.60 -> 5.00 on `hard`, 12.30 -> 10.65 on `big`). It was
-  assumed not to, on the reasoning that greedy re-plans on whatever map it is handed -- but one fixed maze is
-  one draw, and averaging over twenty includes the awkward ones. Per-episode spread also grows (blocked std
-  6.79 -> 11.39 on `hard`). So a learned policy must be compared against the randomised row, and never
-  against a fixed-map number.
-- **20 episodes is marginal for `big`.** The per-episode standard deviation is ~4.2 deliveries, so the
-  standard error over 20 episodes is ~0.93 and a difference under ~1.9 deliveries is not a result. Use 100
-  episodes (standard error ~0.44) for anything being reported.
+- **Sample size decides whether a number means anything.** On `hard` the same greedy policy on the same seed
+  scores 5.00 over 20 held-out mazes and 6.23 over 100. Nothing changed but which mazes were drawn: the
+  per-episode standard deviation is ~3.4 deliveries on `hard` and ~4.3 on `big`, so 20 episodes give a standard
+  error near 0.8-0.95 and cannot separate policies that differ by less than about two deliveries. Report 100.
+  The 5.00 row is left in the table because it was quoted as a baseline before this was checked.
+- **Randomising the maze does move greedy, though less than the small samples suggested.** It was assumed not
+  to, since greedy re-plans with BFS on whatever map it is handed. One fixed maze is one draw, and the spread
+  across mazes is wide enough that a single-map number should never be compared with a multi-map one.
+- **Lead with deliveries and invalid, then blocked.** `mean_return` has a hard floor of `max_steps × -0.05`
+  whatever the policy does, so it flatters nothing and separates little.
 
 ## Writing an algorithm (guide for the algorithm team)
 
