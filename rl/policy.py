@@ -21,6 +21,16 @@ from pathlib import Path
 from env.observation import DEFAULT_OBS
 from env.warehouse import EnvSpec
 
+def flag(value, name):
+    """A --policy-opt value as a bool: they arrive as strings, so every policy needs this."""
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} wants 0 or 1, got '{value}'")
+
+
 Obs = tuple     # a namedtuple whose fields are the OBS groups' fields, e.g. obs.x, obs.front_t
 
 

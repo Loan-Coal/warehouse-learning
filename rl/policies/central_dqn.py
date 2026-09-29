@@ -27,11 +27,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from env.observation import obs_type
-from env.warehouse import (HEADINGS, HUMAN, N_ACTIONS, ROBOT, VALUE_DECAY_STEPS, VALUE_FLOOR)
-from rl.nav import UNREACHABLE, distance_field, legal_actions
+from env.warehouse import N_ACTIONS
+from rl.features import Features, target_changed
+from rl.nav import legal_actions
 from rl.policies.greedy import GreedyRule
-from rl.policy import Policy
+from rl.policy import Policy, flag
 
 # The batches here are tiny (a few hundred rows through 256-wide layers), so torch spends more
 # time handing work to threads than doing it. Measured on a 16-thread machine: 0.46 s/episode at
@@ -49,9 +49,6 @@ EPS_START, EPS_END, EPS_STEPS = 0.3, 0.05, 150_000
 # part of the rule rather than exploration, so it stays on in evaluation; it is drawn from a
 # separate, per-episode stream so evaluating never disturbs the training trajectory.
 EVAL_EPS = 0.05
-# VIEW mirrors Warehouse(view_range=5); nothing in the repo passes another value and EnvSpec
-# does not carry it, so a scenario that changed it would push dist / VIEW quietly past 1.0.
-VIEW, RAY_TYPES = 5, HUMAN + 1                  # ray range, and the ray types (0 = nothing .. 6 = human)
 NEG = -1e9                                      # Q of an impossible action: beaten by any real one, never -inf
 
 # Rewards reach +30 for a delivery, which would sit far outside the Huber loss's quadratic part
@@ -62,22 +59,9 @@ SHAPE = 0.3                                     # weight of the distance potenti
 GRAD_CLIP = 10.0
 
 
-def one_hot(k, n):
-    return [float(i == k) for i in range(n)]
-
-
 def mlp(n_in, n_out):
     return nn.Sequential(nn.Linear(n_in, HIDDEN), nn.ReLU(), nn.Linear(HIDDEN, HIDDEN), nn.ReLU(),
                          nn.Linear(HIDDEN, n_out))
-
-
-def _flag(value, name):
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    raise ValueError(f"{name} wants 0 or 1, got '{value}'")
 
 
 class CentralDQN(Policy):
@@ -89,38 +73,40 @@ class CentralDQN(Policy):
         self.replay_rng = random.Random(seed + 1)   # sampling the memory, so the two never interleave
         self.eval_rng = random.Random(seed)         # replaced every eval episode, see reset()
         self.expert = GreedyRule(spec, seed)
-        self.use_bfs, self.use_shaping = True, True
+        self.use_shaping = True
         self.memory, self.steps, self.updates, self.loss_ema = [], 0, 0, 0.0
-        self.w, self.h = len(spec.grid[0]), len(spec.grid)
+        self.inputs = Features(spec.obs_features)
+        self.inputs.use(spec.grid)
         self._build()
 
     def configure(self, bfs=None, shaping=None, **unknown):
         if unknown:
             raise ValueError(f"unknown setting {', '.join(sorted(unknown))}; this policy takes bfs, shaping")
-        before = (self.use_bfs, self.use_shaping)
-        if bfs is not None:
-            self.use_bfs = _flag(bfs, "bfs")
+        if bfs is not None and flag(bfs, "bfs") != self.use_bfs:
+            self.inputs = Features(self.spec.obs_features, use_bfs=flag(bfs, "bfs"))
+            self.inputs.use(self.spec.grid)
+            self._build()   # bfs changes how wide a robot's feature row is
         if shaping is not None:
-            self.use_shaping = _flag(shaping, "shaping")
-        if (self.use_bfs, self.use_shaping) != before:
-            self._build()   # bfs changes how wide a robot's feature vector is
+            self.use_shaping = flag(shaping, "shaping")
+
+    @property
+    def use_bfs(self):
+        return self.inputs.use_bfs
+
+    @property
+    def robot_dim(self):
+        return self.inputs.width
 
     def _build(self):
         """(Re)create the net. The input is one robot's features plus the fleet's mean of them."""
         torch.manual_seed(self.seed)
-        self.robot_dim = len(self.robot_features(self._zero_obs()))
         self.net, self.target = mlp(2 * self.robot_dim, N_ACTIONS), mlp(2 * self.robot_dim, N_ACTIONS)
         self.target.load_state_dict(self.net.state_dict())
         self.opt = torch.optim.Adam(self.net.parameters(), lr=LR)
 
-    def _zero_obs(self):
-        """A blank observation, only to measure how long a feature vector is."""
-        cls = obs_type(tuple(self.spec.obs_features))
-        return cls(*([0] * len(cls._fields)))
-
     def reset(self):
         self.expert.spec = self.spec
-        self.w, self.h = len(self.spec.grid[0]), len(self.spec.grid)
+        self.inputs.use(self.spec.grid)
         if not self.training:
             # Evaluation gets its own fresh stream, so measuring the policy leaves the training
             # trajectory bit-for-bit unchanged and every eval of a given net is reproducible.
@@ -225,85 +211,13 @@ class CentralDQN(Policy):
             out.append(REWARD_SCALE * r)
         return out
 
-    @staticmethod
-    def target_changed(o, o2):
-        """True when a pickup or a delivery swapped the target, so the potential jumps."""
-        return ((o.has_task, o.carrying, o.target_x, o.target_y)
-                != (o2.has_task, o2.carrying, o2.target_x, o2.target_y))
+    target_changed = staticmethod(target_changed)
 
     def potential(self, o):
-        """Phi(s) for one robot: nearer to its target is better, and facing it is better still.
-
-        A function of the state alone. That is what makes the shaping potential-based; it is NOT
-        enough to make it policy-invariant, because learning_rewards uses the plain difference
-        rather than Ng, Harada and Russell's discounted form. See the argument there.
-        """
-        if not o.has_task:
-            return 0.0
-        here = distance_field(self.spec.grid, (o.target_x, o.target_y)).at(o.x, o.y)
-        return 0.0 if here == UNREACHABLE else -float(here) + 0.5 * float(self.faces_target(o))
-
-    # ------------------------------------------------------------------ features
+        return self.inputs.potential(o)
 
     def features(self, obs):
-        return torch.tensor([self.robot_features(o) for o in obs], dtype=torch.float32)
-
-    def robot_features(self, o):
-        """One robot's input row. Every feature here is one that some action can change.
-
-        Crate size, robot capacity, raw task age, Manhattan distance and a per-ray "nothing in
-        range" flag were all dropped as unactionable or redundant; TestDroppedFeatures in
-        tests/test_central_dqn.py holds the env properties that make them so, so re-adding one
-        means first breaking a test that says why not.
-        """
-        dx, dy = o.target_x - o.x, o.target_y - o.y
-        v = [o.x / self.w, o.y / self.h, dx / self.w, dy / self.h,
-             float(o.carrying), float(o.has_task), float(self.faces_target(o)),
-             o.priority / 3, self.task_value(o) / 3,
-             float(o.ready), float(max(o.period - 1, 0))]
-        v += one_hot(o.heading, 4)
-        for dist, kind in ((o.front_d, o.front_t), (o.right_d, o.right_t),
-                           (o.back_d, o.back_t), (o.left_d, o.left_t)):
-            # Moving into a robot or a human costs R_BLOCKED, by far the biggest drain on the
-            # score, and it is the one thing the static distance field cannot warn about. The
-            # conjunction "this type AND this range" is spread across a one-hot and a distance,
-            # so the single fact that matters gets its own feature.
-            occupied = float(dist == 1 and kind in (ROBOT, HUMAN))
-            v += [dist / VIEW, occupied] + one_hot(kind, RAY_TYPES)
-        if self.use_bfs:
-            near, deltas = self.distance_features(o)
-            v += [near] + deltas
-        return v
-
-    @staticmethod
-    def task_value(o):
-        """What a delivery would pay right now (env/warehouse.py _value): stationary, unlike age."""
-        if not o.has_task:
-            return 0.0
-        return o.priority * max(VALUE_FLOOR, 1 - o.task_age / VALUE_DECAY_STEPS)
-
-    @staticmethod
-    def faces_target(o):
-        dx, dy = HEADINGS[o.heading]
-        return bool(o.has_task) and (o.x + dx, o.y + dy) == (o.target_x, o.target_y)
-
-    def distance_features(self, o):
-        """How far the target is, and which of front/right/back/left steps closer to it.
-
-        Always returns the same number of values, so the feature vector keeps its width.
-        """
-        if not o.has_task:
-            return 1.0, [0.0] * 4
-        field = distance_field(self.spec.grid, (o.target_x, o.target_y))
-        here = field.at(o.x, o.y)
-        if here == UNREACHABLE:
-            return 1.0, [0.0] * 4
-        deltas = []
-        for turn in range(4):
-            dx, dy = HEADINGS[(o.heading + turn) % 4]
-            there = field.at(o.x + dx, o.y + dy)
-            deltas.append(0.0 if there == UNREACHABLE else float(here - there))   # +1 = a step closer
-        return min(here / (self.w + self.h), 1.0), deltas
+        return self.inputs.fleet(obs)
 
     # ------------------------------------------------------------------ plumbing
 
@@ -328,9 +242,11 @@ class CentralDQN(Policy):
 
     def load(self, folder):
         state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
-        if (state["bfs"], state["shaping"]) != (self.use_bfs, self.use_shaping):
-            # The checkpoint's own settings win: they decide how wide the saved weights are.
-            self.use_bfs, self.use_shaping = state["bfs"], state["shaping"]
+        self.use_shaping = state["shaping"]
+        if state["bfs"] != self.use_bfs:
+            # The checkpoint's own setting wins: it decides how wide the saved weights are.
+            self.inputs = Features(self.spec.obs_features, use_bfs=state["bfs"])
+            self.inputs.use(self.spec.grid)
             self._build()
         self.net.load_state_dict(torch.load(folder / "net.pt", weights_only=True))
         self.target.load_state_dict(self.net.state_dict())
