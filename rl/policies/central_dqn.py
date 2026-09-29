@@ -28,16 +28,14 @@ trained on a small scenario loads straight into a bigger one.
 import json
 import os
 import random
-from collections import deque
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from env.layout import DIRS, access_cells, is_walkable
 from env.observation import obs_type
-from env.warehouse import (BACKWARD, DROPOFF, FORWARD, HEADINGS, HUMAN, N_ACTIONS, PICKUP, ROBOT,
-                           TURN_LEFT, TURN_RIGHT, VALUE_DECAY_STEPS, VALUE_FLOOR)
+from env.warehouse import (HEADINGS, HUMAN, N_ACTIONS, ROBOT, VALUE_DECAY_STEPS, VALUE_FLOOR)
+from rl.nav import UNREACHABLE, distance_field, legal_actions
 from rl.policies.greedy import GreedyRule
 from rl.policy import Policy
 
@@ -77,40 +75,6 @@ def mlp(n_in, n_out):
                          nn.Linear(HIDDEN, n_out))
 
 
-def legal_actions(grid, o):
-    """Which of the 6 actions the env would actually carry out, for one robot.
-
-    The env never tells a policy this: it silently ignores an impossible action and fines it
-    R_INVALID, reporting only a count. PICKUP/DROPOFF need the robot to FACE its target cell,
-    not merely stand beside it (env/warehouse.py _pickup/_dropoff); obs.target_x/target_y is
-    already the pickup cell while empty and the dropoff cell while carrying, so one comparison
-    covers both. Turning is never invalid, so at least one action is always legal.
-    """
-    dx, dy = HEADINGS[o.heading]
-    front, back, target = (o.x + dx, o.y + dy), (o.x - dx, o.y - dy), (o.target_x, o.target_y)
-    legal = [False] * N_ACTIONS
-    legal[PICKUP] = bool(o.has_task) and not o.carrying and front == target
-    legal[DROPOFF] = bool(o.carrying) and front == target
-    legal[TURN_RIGHT] = legal[TURN_LEFT] = True
-    legal[FORWARD] = is_walkable(grid, *front)
-    legal[BACKWARD] = is_walkable(grid, *back)
-    return legal
-
-
-def distances_to(grid, goals):
-    """Steps from every walkable cell to the nearest goal cell, as {(x, y): steps}."""
-    dist = {cell: 0 for cell in goals}
-    frontier = deque(dist)
-    while frontier:
-        x, y = frontier.popleft()
-        for dx, dy in DIRS:
-            nxt = (x + dx, y + dy)
-            if nxt not in dist and is_walkable(grid, *nxt):
-                dist[nxt] = dist[(x, y)] + 1
-                frontier.append(nxt)
-    return dist
-
-
 def _flag(value, name):
     text = str(value).strip().lower()
     if text in ("1", "true", "yes", "on"):
@@ -131,7 +95,6 @@ class CentralDQN(Policy):
         self.expert = GreedyRule(spec, seed)
         self.use_bfs, self.use_shaping = True, True
         self.memory, self.steps, self.updates, self.loss_ema = [], 0, 0, 0.0
-        self._fields, self._field_grid = {}, None
         self._measure_map()
         self._build()
 
@@ -281,8 +244,8 @@ class CentralDQN(Policy):
         """
         if not o.has_task:
             return 0.0
-        here = self.distance_field((o.target_x, o.target_y)).get((o.x, o.y))
-        return 0.0 if here is None else -float(here) + 0.5 * float(self.faces_target(o))
+        here = distance_field(self.spec.grid, (o.target_x, o.target_y)).at(o.x, o.y)
+        return 0.0 if here == UNREACHABLE else -float(here) + 0.5 * float(self.faces_target(o))
 
     # ------------------------------------------------------------------ features
 
@@ -333,24 +296,16 @@ class CentralDQN(Policy):
         """
         if not o.has_task:
             return 1.0, [0.0] * 4
-        field = self.distance_field((o.target_x, o.target_y))
-        here = field.get((o.x, o.y))
-        if here is None:
+        field = distance_field(self.spec.grid, (o.target_x, o.target_y))
+        here = field.at(o.x, o.y)
+        if here == UNREACHABLE:
             return 1.0, [0.0] * 4
         deltas = []
         for turn in range(4):
             dx, dy = HEADINGS[(o.heading + turn) % 4]
-            there = field.get((o.x + dx, o.y + dy))
-            deltas.append(0.0 if there is None else float(here - there))    # +1 = a step closer
+            there = field.at(o.x + dx, o.y + dy)
+            deltas.append(0.0 if there == UNREACHABLE else float(here - there))   # +1 = a step closer
         return min(here / (self.w + self.h), 1.0), deltas
-
-    def distance_field(self, cell):
-        """Steps to `cell` from anywhere, cached per target and rebuilt only when the map changes."""
-        if self._field_grid is not self.spec.grid:
-            self._fields, self._field_grid = {}, self.spec.grid
-        if cell not in self._fields:
-            self._fields[cell] = distances_to(self.spec.grid, access_cells(self.spec.grid, cell))
-        return self._fields[cell]
 
     # ------------------------------------------------------------------ plumbing
 

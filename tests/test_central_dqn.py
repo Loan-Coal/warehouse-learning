@@ -11,7 +11,8 @@ import unittest
 
 from env.layout import maze_layout
 from env.warehouse import N_ACTIONS, TURN_LEFT, TURN_RIGHT, Warehouse
-from rl.policies.central_dqn import CentralDQN, legal_actions
+from rl.nav import legal_actions
+from rl.policies.central_dqn import CentralDQN
 
 ROBOTS, STEPS = 4, 60
 FACTORS = dict(mixed_crates=True, mixed_robots=True, priority=True, humans=2)
