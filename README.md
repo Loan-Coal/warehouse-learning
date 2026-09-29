@@ -30,9 +30,9 @@ replay that folder in the terminal or in Isaac Sim.
 | Folder | Owner | What | Dependencies |
 |---|---|---|---|
 | `env/` | shared contract | maps (`layout.py`), dynamics and rewards (`warehouse.py`), observation features (`observation.py`), named scenarios (`scenarios.py`) | stdlib only |
-| `rl/` | algorithm team | algorithms (`rl/policies/`), their interface (`policy.py`), flags (`cli.py`), episode loop (`loop.py`), train/eval (`run.py`), benchmark (`bench.py`), charts (`plot.py`) | `env`, matplotlib for charts; never Isaac |
+| `rl/` | algorithm team | algorithms (`rl/policies/`), their interface (`policy.py`), flags (`cli.py`), episode loop (`loop.py`), train/eval (`run.py`), benchmark (`bench.py`), charts (`plot.py`), and three shared helpers: what the env will not tell you (`nav.py`), the network inputs (`features.py`), many envs at once (`vecenv.py` + `vecloop.py`) | `env`, matplotlib for charts; never Isaac |
 | `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with NVIDIA warehouse assets | `env`, `rl`, Isaac Sim |
-| `tests/` | shared | the contract (`test_env.py`), every registered algorithm (`test_policies.py`), the baseline (`test_greedy.py`), the tools (`test_tools.py`) | |
+| `tests/` | shared | the contract (`test_env.py`), every registered algorithm (`test_policies.py`), the baseline (`test_greedy.py`), the tools (`test_tools.py`), the shared helpers (`test_nav.py`, `test_vecenv.py`) and the two learners (`test_central_dqn.py`, `test_ppo.py`) | |
 
 A change to `env/` that breaks `tests/test_env.py` affects everyone. Any change to the observation, the actions or
 the rewards must bump `CONTRACT_VERSION` in `env/warehouse.py`, so old checkpoints are refused instead of silently
@@ -56,6 +56,7 @@ python -m unittest discover -s tests               # all tests
 python -m rl.run                                   # watch one episode in the terminal, greedy, default map
 python -m rl.run --maze --seed 3 --max-steps 200   # a random maze of racks (--size 15 13 for bigger)
 python -m rl.run --scenario hard                   # every factor on (see Scenarios)
+python -m rl.run --policy ppo --checkpoint checkpoints/ppo   # watch a trained policy
 python -m rl.run --help                            # every flag
 ```
 
@@ -166,13 +167,31 @@ All are optional except `act` / `act_one`. For a `RobotPolicy`, `update` is `upd
 act(obs_list) -> list[int]                                     # or act_one(obs) -> int
 update(obs_list, actions, rewards, next_obs_list, done)        # learners: called after every training step
 reset()                                                        # called at the start of every episode
+configure(**opts)                                              # your --policy-opt KEY=VALUE settings
+stats() -> dict                                                # extra columns for train_log.csv
 save(folder) / load(folder)                                    # learners: write / read your weights
+
+act_vec(obs_per_env) -> list[list[int]]                        # optional: several envs in one go
+update_vec(obs, actions, rewards, next_obs, dones)             # optional: the same, for learning
 ```
 
 - `update` is **only** called with `--train`: never in evaluation, in the benchmark or in Isaac. Use `self.training`
   to switch exploration off when it is `False`, as the template does.
 - `done` is always a time-limit cut, never a real end state: keep bootstrapping from `next_obs`.
 - `self.spec.grid` is the current map (it is refreshed before every episode, which matters with `--new-map`).
+- `configure` receives **strings** (`--policy-opt bfs=0` arrives as `"0"`); `rl.policy.flag` turns one into a bool.
+  It is called once, before any checkpoint is loaded, and a checkpoint remembers what it was trained with.
+- `stats()` values land in `train_log.csv` for any key in `LOG_FIELDS` (`rl/run.py`); unknown keys are dropped, so
+  adding a column means appending to that tuple. Never return a training-schedule value you would not want read as
+  if it applied to an evaluation episode.
+- `act_vec` / `update_vec` are optional. The defaults call `act` / `update` once per env, so `--envs N` works on
+  your policy untouched -- it just will not be any faster. Override them to put every robot of every env through
+  one forward pass; `rl/policies/ppo.py` is the worked example. Note that the envs share one map per round, which
+  is why one `self.spec` is enough (`rl/vecloop.py` explains why).
+- Two things the env deliberately does not tell you, both in `rl/nav.py` so you do not have to rediscover them:
+  **which actions are legal** (`legal_actions`) -- an impossible action is silently ignored and fined, and
+  `PICKUP`/`DROPOFF` need you to *face* the target, not stand beside it -- and **how far your target is**
+  (`distance_field`). `rl/features.py` turns an observation into the network row both learners use.
 - In `save`, write plain files into `folder` (JSON for tables, `torch.save(model.state_dict(), ...)` for networks),
   never pickle the whole object. The runner writes `meta.json` next to them for you.
 - Libraries: if you need numpy or torch, add exactly `numpy==1.26.0` or `torch==2.7.0` to `requirements.txt`
@@ -205,11 +224,41 @@ evaluation mode, and checks that `save` then `load` restores everything. A failu
 This writes into `checkpoints/myalgo/`:
 - the final checkpoint, plus `ep_000500/`, `ep_001000/`, …: a snapshot every 500 episodes, so you can later
   watch how the robots behaved *during* training;
-- `train_log.csv`: one row per episode (deliveries, value, blocked, invalid, mean return).
+- `train_log.csv`: one row per episode — `deliveries, value, blocked, invalid, mean_return`, a `mode` column
+  saying whether the row is training or evaluation, and whatever your `stats()` returned.
 
-Draw the learning curve (`checkpoints/myalgo/learning_curve.png`); pass several folders to compare runs:
+**Always train with held-out evaluation.** Add `--eval-every 500 --eval-episodes 20`:
+
+    python -m rl.run --policy myalgo --scenario hard --maze --new-map --maze-pool 256 --train \
+        --episodes 20000 --no-render --print-every 500 --eval-every 500 --eval-episodes 20 \
+        --save checkpoints/myalgo
+
+Every 500 episodes that plays 20 episodes on maps drawn from `--eval-seed` (90000 by default), which
+`--maze-pool` keeps training away from, with learning and exploration switched off. `rl.run` refuses to start
+if the two ranges could overlap.
+
+This is not optional bookkeeping. A training-mode curve mixes in whatever exploration and teacher the policy
+uses, and the last version of this project reported one for 3000 episodes while the network had learned
+nothing — a scripted teacher was making every delivery, and the curve fell off a cliff on the exact episode
+that teacher finished fading out. If a number was produced with exploration on, it is not a result.
+
+`--eval-scenario`, `--eval-robots` and `--eval-size` evaluate somewhere other than where you trained, which is
+how you find out whether a policy generalises rather than memorises.
+
+Draw the learning curve (`checkpoints/myalgo/learning_curve.png`); training and evaluation are drawn as separate
+series, and passing several folders compares runs:
 
     python -m rl.plot checkpoints/myalgo
+
+### 7b. Train faster: several envs at once
+
+    python -m rl.run --policy ppo --scenario big --maze --new-map --maze-pool 256 --train --envs 16 \
+        --total-steps 20000000 --no-render --print-every 500 --eval-every 1000 --eval-episodes 20 \
+        --save checkpoints/ppo --snapshot-every 2000
+
+`--envs N` steps N warehouses together so one network call serves them all, and `--total-steps` stops the run on
+an env-step budget instead of an episode count. It only helps if your policy overrides `act_vec` (see Methods);
+otherwise the default plays the envs one at a time and you get nothing for it.
 
 ### 8. Evaluate and watch
 
