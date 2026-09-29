@@ -1,19 +1,13 @@
 """Several Warehouses stepped together, so one network call serves all of them.
 
-Measured on a single env at the `big` scenario, only ~9% of a step is spent inside env.step();
-the rest is Python in the policy and the network call itself, and act() runs on a batch of one
-fleet -- a few rows through 256-wide layers, which is almost entirely call overhead. Stepping K
-envs in one process does not make the simulator faster. It makes the K network calls into one,
-which is where the time actually goes.
+This does not make the simulator faster. It turns K small network calls into one, which is where
+the time goes (LEARNINGS.md). Everything stays in this process: no pickling, no spawn, and still
+exactly reproducible from the seeds.
 
-Everything stays in this process and on one thread: no pickling, no spawn, and the whole thing
-is still exactly reproducible from the seeds.
-
-The env never reaches a terminal state -- `done` is always the step limit (env/warehouse.py). So
-the return beyond an episode boundary is real and has to be estimated, not assumed to be zero,
-and a learner needs the observation the episode ENDED on rather than the one it restarted from.
-step() hands back both; getting this wrong is invisible and quietly caps what any value-based or
-actor-critic method can learn.
+The env never reaches a terminal state -- `done` is always the step limit. So the return past an
+episode boundary is real and must be estimated rather than assumed zero, and a learner needs the
+observation the episode ENDED on, not the one it restarted from. step() hands back both; getting
+this wrong is invisible.
 """
 
 

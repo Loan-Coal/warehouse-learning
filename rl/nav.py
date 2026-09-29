@@ -1,8 +1,7 @@
 """The two things the env knows but never tells a policy: what is legal, and how far away.
 
-Both are needed by any algorithm that plays this env well, and neither is in the observation, so
-they live here once instead of being rediscovered inside each one. tests/test_nav.py pins them
-against the env's own rules, in both directions.
+Neither is in the observation and both are needed by any algorithm that plays this env well, so
+they live here once. tests/test_nav.py pins them against the env's own rules, both directions.
 """
 from array import array
 from collections import deque
@@ -10,10 +9,6 @@ from collections import deque
 from env.layout import DIRS, access_cells, is_walkable
 from env.warehouse import (BACKWARD, DROPOFF, FORWARD, HEADINGS, N_ACTIONS, PICKUP, TURN_LEFT,
                            TURN_RIGHT)
-
-# A turn is always legal (env/warehouse.py never fines one), so it is the safe fallback for
-# field_action whenever the field has nothing to say.
-SAFE = TURN_RIGHT
 
 UNREACHABLE = -1
 
@@ -27,13 +22,10 @@ _FIELDS = {}
 def legal_actions(grid, o):
     """Which of the 6 actions the env would actually carry out, for one robot.
 
-    The env never tells a policy this: it silently ignores an impossible action and fines it
-    R_INVALID, reporting only a count. PICKUP/DROPOFF need the robot to FACE its target cell, not
-    merely stand beside it (env/warehouse.py _pickup/_dropoff); obs.target_x/target_y is already
-    the pickup cell while empty and the dropoff cell while carrying, so one comparison covers
-    both. Turning is never invalid, so at least one action is always legal.
-
-    Stepping into a human IS legal here: the env charges R_BLOCKED for that, not R_INVALID.
+    PICKUP/DROPOFF need the robot to FACE its target, not merely stand beside it; obs.target is
+    already the pickup cell while empty and the dropoff while carrying, so one comparison covers
+    both. Turning is never invalid, so at least one action is always legal. Stepping into a human
+    IS legal -- the env charges R_BLOCKED for that, not R_INVALID.
     """
     dx, dy = HEADINGS[o.heading]
     front, back, target = (o.x + dx, o.y + dy), (o.x - dx, o.y - dy), (o.target_x, o.target_y)
@@ -49,12 +41,10 @@ def legal_actions(grid, o):
 class Field:
     """Steps from every cell of one map to one target, as a flat array indexed by y * width + x.
 
-    Measured against the dict of (x, y) -> steps it replaces, on a 21x21 maze: 1.8 KB instead of
-    30 KB per field (17x), and 1.6x faster to build, but individual lookups are ~3.8x SLOWER,
-    because at() is a Python call where dict.get is C. Building dominates here -- a new map every
-    episode rebuilds ~60 fields, which costs far more than the ~50 reads per env step -- and the
-    memory is what lets one cache span many maps at all. Do not index .steps directly: a
-    neighbour of a walkable cell can be out of bounds and a negative index would wrap silently.
+    Against the dict it replaces, on a 21x21 maze: 17x less memory and 1.6x faster to build, but
+    lookups are ~3.8x slower since at() is a Python call where dict.get is C. Building dominates.
+    Do not index .steps directly -- a neighbour of a walkable cell can be off the map, and a
+    negative index would wrap into the opposite row and return a plausible wrong distance.
     """
     __slots__ = ("width", "height", "steps")
 
@@ -71,10 +61,9 @@ class Field:
 def distance_field(grid, cell):
     """Shortest walkable distance to `cell` from anywhere, built once per (map, target).
 
-    An MLP cannot work out shortest paths through a maze from coordinates and rays -- path length
-    is an iterative graph computation, and with a new maze every episode there is nothing to
-    memorise either. So navigation is solved analytically here and handed to the network as a few
-    numbers; what the network has to learn is the coordination, which is map-agnostic.
+    Navigation is solved analytically because an MLP cannot do it: path length is an iterative
+    graph computation. What the network then has to learn is the coordination, which is
+    map-agnostic -- and that is what makes generalising to unseen mazes possible (LEARNINGS.md).
     """
     key = (grid, cell)
     field = _FIELDS.get(key)
@@ -85,36 +74,6 @@ def distance_field(grid, cell):
         field = _FIELDS[key] = _build(grid, access_cells(grid, cell))
         return field
     return field
-
-
-def field_action(grid, o, legal):
-    """The move the shortest-path field implies for one robot. Always a legal action.
-
-    GreedyRule answers the same question well, but runs a fresh BFS per robot per step to do it.
-    This reads the field the features already built, so using it as a teacher costs nothing. It
-    is a weaker teacher on purpose: it does not look at the other robots at all, which is
-    precisely the part a learner is supposed to improve on.
-    """
-    if legal[PICKUP]:
-        return PICKUP
-    if legal[DROPOFF]:
-        return DROPOFF
-    if not o.has_task:
-        return SAFE
-    field = distance_field(grid, (o.target_x, o.target_y))
-    here = field.at(o.x, o.y)
-    if here == UNREACHABLE:
-        return SAFE
-    nearest, quarter = here, None
-    for turn in range(4):
-        dx, dy = HEADINGS[(o.heading + turn) % 4]
-        there = field.at(o.x + dx, o.y + dy)
-        if there != UNREACHABLE and there < nearest:
-            nearest, quarter = there, turn
-    if quarter is None:
-        return SAFE
-    move = (FORWARD, TURN_RIGHT, BACKWARD, TURN_LEFT)[quarter]
-    return move if legal[move] else SAFE
 
 
 def _build(grid, goals):

@@ -32,7 +32,12 @@ replay that folder in the terminal or in Isaac Sim.
 | `env/` | shared contract | maps (`layout.py`), dynamics and rewards (`warehouse.py`), observation features (`observation.py`), named scenarios (`scenarios.py`) | stdlib only |
 | `rl/` | algorithm team | algorithms (`rl/policies/`), their interface (`policy.py`), flags (`cli.py`), episode loop (`loop.py`), train/eval (`run.py`), benchmark (`bench.py`), charts (`plot.py`), and three shared helpers: what the env will not tell you (`nav.py`), the network inputs (`features.py`), many envs at once (`vecenv.py` + `vecloop.py`) | `env`, matplotlib for charts; never Isaac |
 | `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with NVIDIA warehouse assets | `env`, `rl`, Isaac Sim |
-| `tests/` | shared | the contract (`test_env.py`), every registered algorithm (`test_policies.py`), the baseline (`test_greedy.py`), the tools (`test_tools.py`), the shared helpers (`test_nav.py`, `test_vecenv.py`) and the two learners (`test_central_dqn.py`, `test_ppo.py`) | |
+| `tests/` | shared | the contract (`test_env.py`), every registered algorithm (`test_policies.py`), the baseline (`test_greedy.py`), the tools (`test_tools.py`), the shared helpers (`test_nav.py`, `test_features.py`, `test_vecenv.py`) and the learner (`test_ppo.py`) | |
+
+**[LEARNINGS.md](LEARNINGS.md) is worth reading before you write an algorithm.** It is what was
+measured rather than assumed: why the action mask exists, why the reward shaping is not the textbook
+form, why there are no exploration schedules, and which optimisations turned out not to pay. Most of
+it cost a training run to find out.
 
 A change to `env/` that breaks `tests/test_env.py` affects everyone. Any change to the observation, the actions or
 the rewards must bump `CONTRACT_VERSION` in `env/warehouse.py`, so old checkpoints are refused instead of silently

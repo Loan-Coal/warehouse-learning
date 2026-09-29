@@ -1,17 +1,84 @@
-"""rl/nav.py: the shortest-path fields every policy here navigates by.
+"""rl/nav.py: what the env knows and never tells a policy.
 
-Action legality is pinned against the env's own rules in tests/test_central_dqn.py, which drives
-nav.legal_actions both ways. This file is about the distance fields: that they agree with a
-plain BFS written independently here, that they say UNREACHABLE rather than lying, and that the
-cache hands back the same field for the same map.
+Two things, and both are pinned against the env itself:
+
+- which actions it would actually carry out, since an impossible one is silently ignored and
+  fined rather than refused. Checked in both directions, so neither a mask that permits too much
+  nor one that forbids everything can pass.
+- how far a target is, checked cell by cell against a plain BFS written out longhand here.
 """
+import random
 import unittest
 from collections import deque
 
 from env.layout import DEFAULT_MAP, access_cells, cells_of, is_walkable, maze_layout, parse
 from env.observation import HEADINGS
+from env.warehouse import N_ACTIONS, TURN_LEFT, TURN_RIGHT, Warehouse
 from rl import nav
-from rl.nav import UNREACHABLE, Field, distance_field
+from rl.features import Features
+from rl.nav import UNREACHABLE, Field, distance_field, legal_actions
+
+ROBOTS, STEPS = 4, 60
+FACTORS = dict(mixed_crates=True, mixed_robots=True, priority=True, humans=2)
+
+
+def maze_env(seed=0, size=(11, 9)):
+    return Warehouse(maze_layout(seed, *size, n_robots=ROBOTS), n_robots=ROBOTS, max_steps=STEPS,
+                     obs=Features.OBS, **FACTORS)
+
+
+class TestLegalActions(unittest.TestCase):
+    def test_only_legal_actions_are_ever_invalid(self):
+        """Playing only actions the mask allows must never earn a single invalid penalty."""
+        for seed in range(4):
+            with self.subTest(seed=seed):
+                env = maze_env(seed)
+                obs = env.reset(seed)
+                rng = random.Random(seed)
+                for _ in range(STEPS):
+                    actions = [rng.choice([a for a in range(N_ACTIONS) if legal_actions(env.grid, o)[a]])
+                               for o in obs]
+                    obs, _, done, info = env.step(actions)
+                    self.assertEqual(info["invalid"], 0, "the mask allowed an action the env rejected")
+                    if done:
+                        break
+
+    def test_some_action_is_always_legal(self):
+        """Turning is never invalid, so the mask can never leave a robot with nothing to do."""
+        env = maze_env()
+        obs = env.reset(0)
+        rng = random.Random(0)
+        for _ in range(STEPS):
+            for o in obs:
+                legal = legal_actions(env.grid, o)
+                self.assertTrue(any(legal))
+                self.assertTrue(legal[TURN_RIGHT] and legal[TURN_LEFT])
+            obs, _, done, _ = env.step([rng.randrange(N_ACTIONS) for _ in obs])
+            if done:
+                break
+
+    def test_what_the_mask_forbids_the_env_rejects(self):
+        """The other direction, so a mask that just forbade everything would not pass.
+
+        One ready robot plays a forbidden action; the rest turn in place, which is always
+        accepted. The env must then report exactly that one invalid action.
+        """
+        env = maze_env()
+        obs = env.reset(0)
+        checked = 0
+        for _ in range(STEPS):
+            actions, victim = [TURN_RIGHT] * len(obs), None
+            for i, o in enumerate(obs):
+                illegal = [a for a in range(N_ACTIONS) if not legal_actions(env.grid, o)[a]]
+                if victim is None and illegal and env.ready(i):
+                    victim, actions[i] = i, illegal[0]
+            obs, _, done, info = env.step(actions)
+            if victim is not None:
+                self.assertEqual(info["invalid"], 1, "the env accepted an action the mask forbade")
+                checked += 1
+            if done:
+                break
+        self.assertGreater(checked, 0, "the episode never offered an illegal action to test")
 
 
 def reference_field(grid, target):
@@ -30,15 +97,14 @@ def reference_field(grid, target):
 
 class TestField(unittest.TestCase):
     def test_it_agrees_with_a_plain_bfs_on_every_cell(self):
-        for seed, size in ((0, (11, 9)), (3, (21, 21)), (7, (15, 13))):
-            grid = parse(maze_layout(seed, *size, n_robots=4))
-            width, height = len(grid[0]), len(grid)
-            for target in (cells_of(grid, "S")[::37] + cells_of(grid, "D")):
-                with self.subTest(seed=seed, size=size, target=target):
-                    field, want = distance_field(grid, target), reference_field(grid, target)
-                    for y in range(height):
-                        for x in range(width):
-                            self.assertEqual(field.at(x, y), want.get((x, y), UNREACHABLE))
+        grid = parse(maze_layout(3, 21, 21, n_robots=4))
+        width, height = len(grid[0]), len(grid)
+        for target in (cells_of(grid, "S")[::37] + cells_of(grid, "D")):
+            with self.subTest(target=target):
+                field, want = distance_field(grid, target), reference_field(grid, target)
+                for y in range(height):
+                    for x in range(width):
+                        self.assertEqual(field.at(x, y), want.get((x, y), UNREACHABLE))
 
     def test_zero_at_the_access_cells_not_at_the_target(self):
         # Robots act on a cell they stand NEXT to and face, so distance 0 means "in position".

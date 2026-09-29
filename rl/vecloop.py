@@ -1,22 +1,18 @@
 """Training with several envs at once. --envs 1 keeps the plain loop, so nothing changes by default.
 
 rl/loop.py stays the one-episode loop that rl.bench, isaac/demo.py and every evaluation use. This
-module is only the training path taken by --envs N, and it writes exactly the same train_log.csv
-columns, so rl.plot needs no idea it exists.
+is only the training path taken by --envs N, and it writes the same train_log.csv columns.
 
-THE ENVS RUN IN LOCKSTEP ON A SHARED MAP, and that is a deliberate limitation. A policy is handed
-one `spec`, and both things a policy has to work out for itself -- which actions are legal, and
-how far its target is -- are functions of that one grid (rl/nav.py). Giving each slot its own maze
-would therefore mean handing the policy a spec per slot, which is an interface change every
-colleague's file would have to absorb. Instead every slot plays the same map and, because every
-episode runs to the same step limit and the env has no terminal state, they all end on the same
-step; the map changes for all of them together.
+THE ENVS RUN IN LOCKSTEP ON A SHARED MAP, deliberately. A policy gets one `spec`, and both things
+it has to work out for itself -- action legality and target distance -- are functions of that one
+grid. Per-slot mazes would mean a spec per slot: an interface change every colleague's file would
+absorb. Since every episode runs to the same step limit and the env never terminates, the slots
+end together and the map changes for all of them at once.
 
-The cost is real and worth stating: a rollout shorter than an episode sees one maze, so a few
-consecutive updates are correlated by map. With 400-step episodes and a 128-step rollout that is
-three updates per maze out of thousands over a run, which a small-step method tolerates. What is
-NOT lost is map randomisation -- every round of N episodes draws a new maze, and the robot
-starts, human positions, crates and the whole job sequence are redrawn every episode per slot.
+The cost: a rollout shorter than an episode sees one maze, so a few consecutive updates are
+correlated by map -- three per maze out of thousands, which a small-step method tolerates. Map
+randomisation itself is not lost; every round draws a new maze, and robot starts, humans, crates
+and the job sequence are redrawn every episode per slot.
 """
 import time
 

@@ -1,18 +1,13 @@
-"""What every algorithm here shows its network, and why each number is in it.
+"""What an algorithm shows its network, and why each number is in it.
 
-Shared on purpose. If central_dqn and ppo built their own inputs, a comparison between them
-would be a comparison of representations rather than of algorithms, and the more interesting
-question -- which learner suits this problem -- would be unanswerable.
+Shared between policies on purpose: if each built its own inputs, comparing them would compare
+representations rather than learners.
 
-Nothing here is normalised by a running statistic. Every value is divided by a constant known
-in advance (the map width, the ray range, the priority ceiling) or is a one-hot, which keeps the
-feature builder pure: no state to keep in a checkpoint, and no chance of a policy behaving
-differently on its first episode than on its thousandth.
-
-Scale independence is a property, not an accident. Positions are divided by the map size and the
-rays are local, so the row is the same width for a 4-robot 11x9 warehouse as for a 6-robot
-21x21 one, and the pooled fleet summary the networks add (see the policies) is a mean rather
-than a concatenation. That is what lets one checkpoint play a scenario it never trained on.
+Two properties worth not breaking. Nothing is normalised by a running statistic -- every value is
+divided by a constant known in advance or is a one-hot -- so there is no state to checkpoint. And
+the row is the same width for a 4-robot 11x9 warehouse as a 6-robot 21x21 one, which is what lets
+one checkpoint play a scenario it never trained on. LEARNINGS.md says why each feature earns its
+place, and tests/test_features.py holds the env properties behind the ones that were dropped.
 """
 import os
 
@@ -39,11 +34,16 @@ def one_hot(k, n):
 class Features:
     """Observations to network rows, for whichever map is currently installed.
 
+    OBS is the observation groups these rows need; a policy exposes it as its own OBS so the
+    runner builds the env to match (rl/cli.py). It lives here because this is what reads them.
+
     use(grid) before building rows for a new map: the shortest-path features and the shaping
     potential are both relative to it.
     """
 
-    def __init__(self, obs_features, use_bfs=True):
+    OBS = ("position", "heading", "task", "rays", "crate", "robot")
+
+    def __init__(self, obs_features=OBS, use_bfs=True):
         self.obs_features = tuple(obs_features)
         self.use_bfs = use_bfs
         self.grid, self.w, self.h = (), 1, 1
@@ -62,11 +62,9 @@ class Features:
     def batch(self, obs_per_env):
         """[envs, robots, width] for several envs, which is the shape the networks want.
 
-        Not a speed-up: measured against stacking per-env fleet() calls it is 1.00x, because 83%
-        of the time is the Python loop in row() and only the rest is building the tensor. At 16
-        envs of 6 robots that loop costs ~950 us per vectorised step, which makes it the largest
-        single cost in the whole loop now that the network calls are batched. Turning row() into
-        array arithmetic is the next real optimisation if one is needed.
+        Not a speed-up -- measured at 1.00x against per-env fleet() calls, because 83% of the cost
+        is the Python loop in row(). That loop is now the biggest single cost in the whole
+        training step; see LEARNINGS.md before optimising anything else.
         """
         return torch.tensor([[self.row(o) for o in one] for one in obs_per_env],
                             dtype=torch.float32)
@@ -75,9 +73,8 @@ class Features:
         """One robot's input. Every feature here is one that some action can change.
 
         Crate size, robot capacity, raw task age, Manhattan distance and a per-ray "nothing in
-        range" flag were all dropped as unactionable or redundant; TestDroppedFeatures in
-        tests/test_central_dqn.py holds the env properties that make them so, so re-adding one
-        means first breaking a test that says why not.
+        range" flag were dropped as unactionable or redundant. tests/test_features.py holds the
+        env properties that make them so, so re-adding one means first breaking a test.
         """
         dx, dy = o.target_x - o.x, o.target_y - o.y
         v = [o.x / self.w, o.y / self.h, dx / self.w, dy / self.h,
@@ -119,9 +116,8 @@ class Features:
     def potential(self, o):
         """Phi(s) for one robot: nearer to its target is better, and facing it is better still.
 
-        A function of the state alone. That is what makes reward shaping built on it
-        potential-based; it is NOT enough to make it policy-invariant unless the discounted form
-        is used, and the policies here deliberately do not use it -- see their learning_rewards.
+        A function of the state alone, which is what makes shaping built on it potential-based --
+        though not policy-invariant, since the policies use the plain difference (LEARNINGS.md).
         """
         if not o.has_task:
             return 0.0

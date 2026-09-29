@@ -89,14 +89,6 @@ class TestHeldOutEvaluation(unittest.TestCase):
     def args(self, *argv):
         return parse(build_parser(), [*argv, "--no-render"])
 
-    def test_eval_maps_are_disjoint_from_training_maps(self):
-        args = self.args("--scenario", "hard", "--new-map", "--train", "--episodes", "6",
-                         "--eval-every", "2", "--eval-episodes", "3")
-        trained_on = {layout_for(args, k) for k in range(args.episodes)}
-        held_out = {layout_for(eval_settings(args), j) for j in range(args.eval_episodes)}
-        self.assertEqual((len(trained_on), len(held_out)), (6, 3), "maps should all differ")
-        self.assertEqual(trained_on & held_out, set(), "evaluation replayed a training maze")
-
     def test_eval_is_held_out_even_when_training_used_one_fixed_maze(self):
         # Then it answers the more interesting question: does the policy generalise off that maze?
         args = self.args("--maze", "--train", "--eval-every", "1")

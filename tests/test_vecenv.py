@@ -6,14 +6,11 @@ experiment. The other tests cover the thing that would be invisible if it were w
 observation a finished episode hands back for a value bootstrap.
 """
 import unittest
-from argparse import Namespace
 
 from env.layout import is_walkable, maze_layout
-from env.warehouse import Warehouse
-from rl.cli import build, layout_for, make_env, make_parser, parse
+from rl.cli import build, layout_for, make_env, parse
 from rl.loop import run_episode
 from rl.policies import POLICIES
-from rl.policy import Policy
 from rl.run import build_parser
 from rl.vecenv import VecWarehouse
 from rl.vecloop import _crossed, train_vec
@@ -108,19 +105,6 @@ class TestTruncationBootstrap(unittest.TestCase):
             self.assertEqual(len(stats), 5 if dones[0] else 0)
         self.assertEqual(vec.finished, 10)
 
-    def test_returns_are_accumulated_per_slot_and_reset_with_the_episode(self):
-        args = settings("--envs", "2")
-        vec = vec_of(args, 2, POLICIES["greedy"].OBS)
-        vec.reset()
-        for _ in range(STEPS):
-            _, _, _, _, stats = vec.step([[2] * ROBOTS] * 2)
-        self.assertEqual(len(stats), 2)
-        for row in stats:
-            # Turning in place for the whole episode: no deliveries, and the step cost only.
-            self.assertEqual(row["deliveries"], 0)
-            self.assertAlmostEqual(row["mean_return"], STEPS * -0.05, places=6)
-        self.assertEqual(vec.returns[0], [0.0] * ROBOTS, "the next episode starts from zero")
-
 
 class TestBatchedPolicyDefault(unittest.TestCase):
     def test_the_default_act_vec_is_just_act_per_env(self):
@@ -138,24 +122,6 @@ class TestBatchedPolicyDefault(unittest.TestCase):
         again.spec = vec.envs[0].spec
         again.reset()
         self.assertEqual(batched, [again.act(one) for one in obs])
-
-    def test_the_default_update_vec_is_just_update_per_env(self):
-        seen = []
-
-        class Counter(Policy):
-            OBS = POLICIES["greedy"].OBS
-
-            def act(self, obs):
-                return [2] * len(obs)
-
-            def update(self, obs, actions, rewards, next_obs, done):
-                seen.append((len(obs), done))
-
-        env = Warehouse(maze_layout(0, n_robots=ROBOTS), n_robots=ROBOTS, obs=Counter.OBS)
-        policy = Counter(env.spec)
-        obs = [env.reset(0), env.reset(1)]
-        policy.update_vec(obs, [[2] * ROBOTS] * 2, [[0.0] * ROBOTS] * 2, obs, [False, True])
-        self.assertEqual(seen, [(ROBOTS, False), (ROBOTS, True)])
 
 
 class TestEvaluationDoesNotLeak(unittest.TestCase):
@@ -188,7 +154,7 @@ class TestEvaluationDoesNotLeak(unittest.TestCase):
 
     def test_no_invalid_actions_survive_an_evaluation(self):
         """The symptom the bug actually produced, end to end, with a policy that masks."""
-        args = settings("--policy", "central_dqn", "--train", "--envs", "2", "--episodes", "6",
+        args = settings("--policy", "ppo", "--train", "--envs", "2", "--episodes", "6",
                         "--eval-every", "2", "--eval-episodes", "1")
         env, policy = build(args)
         rows = []

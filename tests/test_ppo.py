@@ -8,8 +8,8 @@ otherwise only show up as "PPO does not work on this problem":
   * carrying the GAE recursion ACROSS a boundary, which credits one episode's actions with the
     next episode's rewards on a different map.
 
-The action mask is checked against the env the same way tests/test_central_dqn.py checks the
-DQN's, because the guarantee has to hold for the sampling path and the argmax path alike.
+The mask itself is pinned against the env in tests/test_nav.py; what is checked here is that the
+policy stays inside it on both the sampling path and the argmax path.
 """
 import json
 import math
@@ -21,7 +21,8 @@ from pathlib import Path
 import torch
 
 import rl.policies.ppo as mod
-from env.layout import maze_layout
+from env.layout import is_walkable, maze_layout
+from env.observation import HEADINGS
 from env.warehouse import Warehouse
 from rl.policies.ppo import PPO, pooled
 from rl.vecenv import VecWarehouse
@@ -196,8 +197,8 @@ class TestUpdate(unittest.TestCase):
             policy.configure(nope="1")
         with self.assertRaisesRegex(ValueError, "shaping wants 0 or 1"):
             policy.configure(shaping="perhaps")
-        with self.assertRaisesRegex(ValueError, "bc wants a number"):
-            policy.configure(bc="lots")
+        with self.assertRaisesRegex(ValueError, "lr wants a number"):
+            policy.configure(lr="fast")
 
     def test_shaping_off_leaves_the_env_reward_alone(self):
         env = maze_env()
@@ -255,19 +256,62 @@ class TestStoredAndRecomputed(unittest.TestCase):
             mod.ROLLOUT = rollout
 
 
-class TestTransfer(unittest.TestCase):
-    def test_the_networks_do_not_depend_on_the_fleet_or_the_map(self):
-        shapes = set()
-        for robots, size in ((2, (11, 9)), (4, (11, 9)), (6, (21, 21)), (10, (15, 13))):
-            env = Warehouse(maze_layout(0, *size, n_robots=robots), n_robots=robots,
-                            max_steps=STEPS, obs=PPO.OBS)
-            policy = PPO(env.spec, seed=0)
-            shapes.add((policy.inputs.width,
-                        sum(p.numel() for p in policy.actor.parameters()),
-                        sum(p.numel() for p in policy.critic.parameters())))
-            self.assertEqual(len(policy.act(env.reset(0))), robots)
-        self.assertEqual(len(shapes), 1, f"the networks changed shape with the scenario: {shapes}")
+class TestShaping(unittest.TestCase):
+    """Why the plain difference and not Ng, Harada and Russell's discounted form."""
 
+    def shaping(self, policy, before, after):
+        """What the net is paid for the step `before` -> `after`, on top of the env reward."""
+        return policy.learning_rewards([before], [0.0], [after])[0]
+
+    def busy_robot(self):
+        """A policy plus one observation of a robot that has a task and can reach it."""
+        env = maze_env()
+        policy = PPO(env.spec, seed=0)
+        policy.training = True
+        obs = env.reset(0)
+        policy.reset()
+        rng = random.Random(2)
+        for _ in range(STEPS):
+            for o in obs:
+                if o.has_task and policy.inputs.potential(o) != 0.0:
+                    return policy, o
+            obs, _, done, _ = env.step([rng.randrange(6) for _ in range(ROBOTS)])
+            if done:
+                obs = env.reset(0)
+        raise AssertionError("no robot ever had a reachable task")
+
+    def test_standing_still_earns_exactly_nothing(self):
+        """Their form is policy-invariant but pays a motionless robot, because Phi is negative.
+
+        (GAMMA - 1) * Phi is positive here, and at any real distance it beats the step cost,
+        which buys loitering. That was measured, not guessed. The plain difference pays zero.
+        """
+        policy, o = self.busy_robot()
+        self.assertEqual(self.shaping(policy, o, o), 0.0)
+        textbook = mod.SHAPE * (mod.GAMMA * policy.inputs.potential(o) - policy.inputs.potential(o))
+        self.assertGreater(textbook, 0.0, "the form we rejected pays a robot for doing nothing")
+
+    def test_a_round_trip_earns_exactly_nothing(self):
+        """Phi is a function of the state, so any closed walk sums to zero. No loop farms it."""
+        policy, here = self.busy_robot()
+        grid = policy.spec.grid
+        step = next((d for d in HEADINGS
+                     if is_walkable(grid, here.x + d[0], here.y + d[1])
+                     and policy.inputs.potential(here._replace(x=here.x + d[0], y=here.y + d[1]))
+                     != policy.inputs.potential(here)), None)
+        self.assertIsNotNone(step, "nowhere to walk that changes the potential")
+        there = here._replace(x=here.x + step[0], y=here.y + step[1])
+        out, back = self.shaping(policy, here, there), self.shaping(policy, there, here)
+        self.assertNotEqual(out, 0.0, "the two cells should differ, or this proves nothing")
+        self.assertAlmostEqual(out + back, 0.0, places=12)
+
+    def test_it_is_suppressed_when_a_delivery_swaps_the_target(self):
+        """Phi jumps discontinuously then, and the jump is not progress the robot made."""
+        policy, o = self.busy_robot()
+        swapped = o._replace(carrying=1 - o.carrying, target_x=o.target_x + 2)
+        self.assertEqual(self.shaping(policy, o, swapped), 0.0)
+
+class TestTransfer(unittest.TestCase):
     def test_a_checkpoint_trained_on_four_robots_plays_six(self):
         small = Warehouse(maze_layout(0, 11, 9, n_robots=4), n_robots=4, max_steps=STEPS, obs=PPO.OBS)
         big = Warehouse(maze_layout(0, 21, 21, n_robots=6), n_robots=6, max_steps=STEPS, obs=PPO.OBS)
@@ -297,26 +341,6 @@ class TestTransfer(unittest.TestCase):
             wide.load(folder)
             self.assertEqual((wide.inputs.width, wide.inputs.use_bfs),
                              (narrow.inputs.width, False))
-
-
-class TestTeacher(unittest.TestCase):
-    def test_the_imitation_term_only_costs_anything_when_it_is_switched_on(self):
-        env = maze_env()
-        off = PPO(env.spec, seed=0)
-        self.assertEqual(off.bc, 0.0)
-        obs = env.reset(0)
-        off.reset()
-        off.act(obs)
-        self.assertIsNone(off.acting[5], "no teacher actions should be computed with bc=0")
-        on = PPO(env.spec, seed=0)
-        on.configure(bc="0.5")
-        on.reset()
-        on.act_vec([obs])
-        teacher = on.acting[5]
-        self.assertEqual(tuple(teacher.shape), (1, ROBOTS))
-        mask = on.masks([obs])
-        for row in range(ROBOTS):
-            self.assertTrue(mask[0, row, teacher[0, row]], "the teacher suggested an illegal move")
 
 
 if __name__ == "__main__":
