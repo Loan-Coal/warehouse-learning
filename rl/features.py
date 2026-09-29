@@ -1,13 +1,9 @@
-"""What an algorithm shows its network, and why each number is in it.
+"""What an algorithm shows its network. LEARNINGS.md says why each number earns its place.
 
-Shared between policies on purpose: if each built its own inputs, comparing them would compare
-representations rather than learners.
-
-Two properties worth not breaking. Nothing is normalised by a running statistic -- every value is
-divided by a constant known in advance or is a one-hot -- so there is no state to checkpoint. And
-the row is the same width for a 4-robot 11x9 warehouse as a 6-robot 21x21 one, which is what lets
-one checkpoint play a scenario it never trained on. LEARNINGS.md says why each feature earns its
-place, and tests/test_features.py holds the env properties behind the ones that were dropped.
+Two properties worth not breaking:
+  * nothing is normalised by a running statistic, so there is no state to checkpoint;
+  * the row is the same width for 4 robots on 11x9 as for 6 on 21x21, which is what lets one
+    checkpoint play a scenario it never trained on.
 """
 import os
 
@@ -17,14 +13,11 @@ from env.observation import HEADINGS, obs_type
 from env.warehouse import HUMAN, ROBOT, VALUE_DECAY_STEPS, VALUE_FLOOR
 from rl.nav import UNREACHABLE, distance_field
 
-# VIEW mirrors Warehouse(view_range=5). Nothing in the repo passes another value and EnvSpec does
-# not carry it, so a scenario that changed it would push dist / VIEW quietly past 1.0.
+# VIEW mirrors Warehouse(view_range=5), which EnvSpec does not carry: another value would push
+# dist / VIEW quietly past 1.0.
 VIEW, RAY_TYPES = 5, HUMAN + 1          # ray range, and the ray types (0 = nothing .. 6 = human)
 
-# The batches here are small enough that torch spends more time handing work to threads than
-# doing it. Measured on a 16-thread machine: 0.46 s/episode at 8 threads against 0.54 at 16 and
-# 0.77 at 1. Set here because this is the module both policies import torch through.
-torch.set_num_threads(min(8, os.cpu_count() or 1))
+torch.set_num_threads(min(8, os.cpu_count() or 1))      # measured best; see LEARNINGS.md
 
 
 def one_hot(k, n):
@@ -34,11 +27,8 @@ def one_hot(k, n):
 class Features:
     """Observations to network rows, for whichever map is currently installed.
 
-    OBS is the observation groups these rows need; a policy exposes it as its own OBS so the
-    runner builds the env to match (rl/cli.py). It lives here because this is what reads them.
-
-    use(grid) before building rows for a new map: the shortest-path features and the shaping
-    potential are both relative to it.
+    OBS is the observation groups the rows need; a policy re-exports it so rl/cli.py builds a
+    matching env. Call use(grid) for a new map: distances and the potential are relative to it.
     """
 
     OBS = ("position", "heading", "task", "rays", "crate", "robot")
@@ -47,8 +37,8 @@ class Features:
         self.obs_features = tuple(obs_features)
         self.use_bfs = use_bfs
         self.grid, self.w, self.h = (), 1, 1
-        # Measured, not asserted: a blank observation has no task, so the shortest-path branch
-        # returns its constant and the (still unset) grid is never touched.
+        # A blank observation has no task, so the shortest-path branch returns its constant and
+        # the still-unset grid is never touched. The width is measured, not asserted.
         blank = obs_type(self.obs_features)
         self.width = len(self.row(blank(*([0] * len(blank._fields)))))
 
@@ -60,11 +50,10 @@ class Features:
         return torch.tensor([self.row(o) for o in obs], dtype=torch.float32)
 
     def batch(self, obs_per_env):
-        """[envs, robots, width] for several envs, which is the shape the networks want.
+        """[envs, robots, width], the shape the networks want.
 
-        Not a speed-up -- measured at 1.00x against per-env fleet() calls, because 83% of the cost
-        is the Python loop in row(). That loop is now the biggest single cost in the whole
-        training step; see LEARNINGS.md before optimising anything else.
+        Not a speed-up: 1.00x against per-env fleet() calls, because 83% of the cost is the
+        Python loop in row() -- now the biggest single cost in a training step (LEARNINGS.md).
         """
         return torch.tensor([[self.row(o) for o in one] for one in obs_per_env],
                             dtype=torch.float32)
@@ -72,9 +61,8 @@ class Features:
     def row(self, o):
         """One robot's input. Every feature here is one that some action can change.
 
-        Crate size, robot capacity, raw task age, Manhattan distance and a per-ray "nothing in
-        range" flag were dropped as unactionable or redundant. tests/test_features.py holds the
-        env properties that make them so, so re-adding one means first breaking a test.
+        Crate size, capacity, raw task age, Manhattan distance and a per-ray "nothing in range"
+        flag were dropped as unactionable or redundant; tests/test_features.py says why not.
         """
         dx, dy = o.target_x - o.x, o.target_y - o.y
         v = [o.x / self.w, o.y / self.h, dx / self.w, dy / self.h,
@@ -84,10 +72,8 @@ class Features:
         v += one_hot(o.heading, 4)
         for dist, kind in ((o.front_d, o.front_t), (o.right_d, o.right_t),
                            (o.back_d, o.back_t), (o.left_d, o.left_t)):
-            # Moving into a robot or a human costs R_BLOCKED, by far the biggest drain on the
-            # score, and it is the one thing the static distance field cannot warn about. The
-            # conjunction "this type AND this range" is spread across a one-hot and a distance,
-            # so the single fact that matters gets its own feature.
+            # R_BLOCKED is the biggest drain on the score and the one thing the distance field
+            # cannot warn about, so "this type AND adjacent" gets its own feature (LEARNINGS.md).
             occupied = float(dist == 1 and kind in (ROBOT, HUMAN))
             v += [dist / VIEW, occupied] + one_hot(kind, RAY_TYPES)
         if self.use_bfs:
@@ -114,10 +100,8 @@ class Features:
         return min(here / (self.w + self.h), 1.0), deltas
 
     def potential(self, o):
-        """Phi(s) for one robot: nearer to its target is better, and facing it is better still.
-
-        A function of the state alone, which is what makes shaping built on it potential-based --
-        though not policy-invariant, since the policies use the plain difference (LEARNINGS.md).
+        """Phi(s): nearer the target is better, facing it better still. A function of state
+        alone, which makes shaping on it potential-based (though not policy-invariant here).
         """
         if not o.has_task:
             return 0.0

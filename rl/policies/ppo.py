@@ -1,15 +1,12 @@
-"""Masked PPO, one set of weights for every robot, each input carrying a summary of the fleet.
+"""Masked PPO: one set of weights for every robot, each input carrying a summary of the fleet.
 
-IPPO/MAPPO in shape: every robot is scored by the same network from its own features plus the
-fleet mean, and trained on its OWN advantage.
+IPPO/MAPPO in shape -- every robot scored by the same network from its own features plus the
+fleet mean, trained on its OWN advantage. Why on-policy, why the shaping is not the textbook
+form, and why there are no schedules: LEARNINGS.md. In short, robots sharing weights make a
+replay buffer hold transitions whose dynamics no longer exist, and a stochastic policy is the
+fix for the deadlock sharing causes -- which is why evaluation samples rather than argmaxes.
 
-Why on-policy here, why the shaping takes the form it does, and why there are no schedules:
-LEARNINGS.md. The short version is that six robots sharing one set of weights make a replay
-buffer hold transitions whose dynamics no longer exist, and that a stochastic policy is the fix
-for the deadlock parameter sharing causes -- which is why evaluation samples rather than argmaxes.
-
-Ablations: --policy-opt bfs=0 drops the shortest-path features, shaping=0 the reward shaping,
-eval_greedy=1 evaluates with argmax instead of sampling.
+Ablations: --policy-opt bfs=0, shaping=0, eval_greedy=1.
 """
 import json
 import random
@@ -37,8 +34,8 @@ NEG = -1e9                      # logit of an impossible action: finite, so entr
 def mlp(n_in, n_out, out_gain):
     """Two hidden layers, orthogonal init, gain sqrt(2) inside and `out_gain` on the head.
 
-    0.01 on the policy head starts the policy almost uniform over the legal actions, so the first
-    rollouts explore rather than commit to whatever the random init happened to like.
+    0.01 on the policy head starts it near-uniform over the legal actions, so the first rollouts
+    explore instead of committing to whatever the random init liked.
     """
     net = nn.Sequential(nn.Linear(n_in, HIDDEN), nn.ReLU(),
                         nn.Linear(HIDDEN, HIDDEN), nn.ReLU(),
@@ -54,8 +51,8 @@ def mlp(n_in, n_out, out_gain):
 def pooled(x):
     """[..., robots, width] -> [..., robots, 2 * width]: own features beside the fleet mean.
 
-    A mean, not a concatenation: the width is then independent of the robot count and the result
-    independent of their order, which is what lets a 4-robot checkpoint play 6.
+    A mean, not a concatenation, so the width is independent of the robot count and the result of
+    their order -- which is what lets a 4-robot checkpoint play 6.
     """
     return torch.cat([x, x.mean(-2, keepdim=True).expand_as(x)], -1)
 
@@ -92,9 +89,9 @@ class PPO(Policy):
             self.eval_greedy = flag(eval_greedy, "eval_greedy")
         if ent is not None:
             self.ent = _number(ent, "ent")
-        rebuild = lr is not None and _number(lr, "lr") != self.lr
-        if lr is not None:
-            self.lr = _number(lr, "lr")
+        rebuild = False
+        if lr is not None and _number(lr, "lr") != self.lr:
+            self.lr, rebuild = _number(lr, "lr"), True
         if bfs is not None and flag(bfs, "bfs") != self.inputs.use_bfs:
             self.inputs = Features(self.spec.obs_features, use_bfs=flag(bfs, "bfs"))
             self.inputs.use(self.spec.grid)
@@ -121,16 +118,16 @@ class PPO(Policy):
     def act_vec(self, obs):
         """Every robot of every env through one forward pass.
 
-        pooled() averages over the robot axis, so each env keeps its own fleet summary and the
-        envs never mix: this is correct, not merely faster.
+        pooled() averages over the robot axis, so envs never mix: correct, not merely faster.
+        Evaluation samples rather than argmaxing -- see the deadlock argument in LEARNINGS.md.
         """
         x = self.inputs.batch(obs)
         mask = self.masks(obs)
         with torch.no_grad():
-            logits = self.actor(pooled(x)).masked_fill(~mask, NEG)
-            value = self.critic(pooled(x)).squeeze(-1)
+            wide = pooled(x)
+            logits = self.actor(wide).masked_fill(~mask, NEG)
+            value = self.critic(wide).squeeze(-1)
             if self.training or not self.eval_greedy:
-                # Sampling in evaluation too: see the deadlock argument in the module docstring.
                 actions = torch.distributions.Categorical(logits=logits).sample()
             else:
                 actions = logits.argmax(-1)
@@ -153,9 +150,8 @@ class PPO(Policy):
         if x.shape[0] != len(obs):
             raise RuntimeError(f"update_vec got {len(obs)} envs but act_vec ran on {x.shape[0]}")
         with torch.no_grad():
-            # next_obs is the real successor, so at an episode boundary it is the state the
-            # episode ENDED on. The env only ever runs out of time, it never reaches a terminal
-            # state, so that value is a real estimate of what came next and is not zeroed.
+            # At a boundary next_obs is the state the episode ENDED on, and the env only runs out
+            # of time, so this value is a real estimate of what came next. Never zeroed.
             after = self.critic(pooled(self.inputs.batch(next_obs))).squeeze(-1)
         self.rollout.append((
             x, mask, acted, logp, value, after,
@@ -170,12 +166,9 @@ class PPO(Policy):
     def learning_rewards(self, obs, rewards, next_obs):
         """The per-robot reward the NET learns from: scaled, and optionally shaped.
 
-        Every number the env reports, and so every number in train_log.csv and rl.bench, is
-        untouched by this.
-
-        The shaping is the PLAIN difference Phi(s') - Phi(s), deliberately not Ng, Harada and
-        Russell's discounted form, which is policy-invariant but pays a motionless robot here.
-        LEARNINGS.md has the sign argument; tests/test_ppo.py TestShaping pins the consequences.
+        Nothing the env reports is touched, so train_log.csv and rl.bench are unaffected. The
+        shaping is the PLAIN difference Phi(s') - Phi(s), deliberately not the discounted form,
+        which pays a motionless robot here (LEARNINGS.md; TestShaping pins the consequences).
         """
         out = []
         for o, r, o2 in zip(obs, rewards, next_obs):
@@ -190,8 +183,8 @@ class PPO(Policy):
         advantage = self._gae(reward, value, after, done)
         returns = advantage + value
 
-        # Flatten time and env together but keep the robot axis: pooled() has to average over
-        # one env's robots, so a minibatch is a set of whole fleets, never of loose robots.
+        # Keep the robot axis: pooled() averages over one env's robots, so a minibatch is a
+        # set of whole fleets, never of loose robots.
         flat = [t.flatten(0, 1) for t in (x, mask, acted, logp, advantage, returns, ready)]
         groups = flat[0].shape[0]
         order = list(range(groups))
@@ -201,7 +194,8 @@ class PPO(Policy):
             for start in range(0, groups, size):
                 self._step([t[order[start:start + size]] for t in flat])
         self.updates += 1
-        self.log["explained_var"] = _explained(returns, value)
+        spread = returns.var()      # 0 means the critic is no better than predicting the mean
+        self.log["explained_var"] = float(1 - (returns - value).var() / spread) if spread > 0 else 0.0
 
     @staticmethod
     def _gae(reward, value, after, done):
@@ -291,10 +285,3 @@ def _number(value, name):
     except (TypeError, ValueError):
         raise ValueError(f"{name} wants a number, got '{value}'") from None
 
-
-def _explained(returns, value):
-    """1 - Var(returns - value) / Var(returns): 0 means the critic is no better than the mean."""
-    spread = returns.var()
-    if spread <= 0:
-        return 0.0
-    return float(1 - (returns - value).var() / spread)

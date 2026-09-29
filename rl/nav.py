@@ -12,20 +12,17 @@ from env.warehouse import (BACKWARD, DROPOFF, FORWARD, HEADINGS, N_ACTIONS, PICK
 
 UNREACHABLE = -1
 
-# Distance fields kept across all maps and targets. One is ~1.8 KB at 21x21, so 20k is ~36 MB and
-# covers every target of ~115 mazes. With --maze-pool bounding the maps in play the working set
-# fits and nothing is ever evicted; without it the cache is a rolling window over recent maps.
-FIELD_CACHE = 20_000
+FIELD_CACHE = 20_000        # ~1.8 KB a field at 21x21, so ~36 MB: a rolling window over maps
 _FIELDS = {}
 
 
 def legal_actions(grid, o):
     """Which of the 6 actions the env would actually carry out, for one robot.
 
-    PICKUP/DROPOFF need the robot to FACE its target, not merely stand beside it; obs.target is
-    already the pickup cell while empty and the dropoff while carrying, so one comparison covers
-    both. Turning is never invalid, so at least one action is always legal. Stepping into a human
-    IS legal -- the env charges R_BLOCKED for that, not R_INVALID.
+    PICKUP/DROPOFF need the robot to FACE its target, and obs.target is already the pickup cell
+    while empty and the dropoff while carrying, so one comparison covers both. A turn is never
+    invalid, so some action is always legal. Stepping into a human is legal too: R_BLOCKED, not
+    R_INVALID.
     """
     dx, dy = HEADINGS[o.heading]
     front, back, target = (o.x + dx, o.y + dy), (o.x - dx, o.y - dy), (o.target_x, o.target_y)
@@ -39,12 +36,11 @@ def legal_actions(grid, o):
 
 
 class Field:
-    """Steps from every cell of one map to one target, as a flat array indexed by y * width + x.
+    """Steps from every cell of one map to one target, indexed by y * width + x.
 
-    Against the dict it replaces, on a 21x21 maze: 17x less memory and 1.6x faster to build, but
-    lookups are ~3.8x slower since at() is a Python call where dict.get is C. Building dominates.
-    Do not index .steps directly -- a neighbour of a walkable cell can be off the map, and a
-    negative index would wrap into the opposite row and return a plausible wrong distance.
+    17x less memory than the dict it replaces and 1.6x faster to build, though at() is ~3.8x
+    slower than dict.get. Building dominates. Never index .steps directly: a neighbour can be off
+    the map, and the negative index would wrap into the opposite row (tests/test_nav.py).
     """
     __slots__ = ("width", "height", "steps")
 
@@ -52,7 +48,7 @@ class Field:
         self.width, self.height, self.steps = width, height, steps
 
     def at(self, x, y):
-        """Steps from (x, y) to the target, or UNREACHABLE for a wall, a rack or a sealed pocket."""
+        """Steps from (x, y), or UNREACHABLE off the map, into a rack, or from a sealed pocket."""
         if 0 <= x < self.width and 0 <= y < self.height:
             return self.steps[y * self.width + x]
         return UNREACHABLE
@@ -61,19 +57,16 @@ class Field:
 def distance_field(grid, cell):
     """Shortest walkable distance to `cell` from anywhere, built once per (map, target).
 
-    Navigation is solved analytically because an MLP cannot do it: path length is an iterative
-    graph computation. What the network then has to learn is the coordination, which is
-    map-agnostic -- and that is what makes generalising to unseen mazes possible (LEARNINGS.md).
+    Navigation is solved here, not learned: path length is an iterative graph computation an MLP
+    cannot represent. The network is left with the coordination, which is map-agnostic and so can
+    generalise to mazes it never saw (LEARNINGS.md).
     """
     key = (grid, cell)
-    field = _FIELDS.get(key)
-    if field is None:
+    if key not in _FIELDS:
         if len(_FIELDS) >= FIELD_CACHE:
-            # Cheaper than per-hit LRU bookkeeping, and a bounded --maze-pool never gets here.
-            _FIELDS.clear()
-        field = _FIELDS[key] = _build(grid, access_cells(grid, cell))
-        return field
-    return field
+            _FIELDS.clear()     # cheaper than per-hit LRU bookkeeping
+        _FIELDS[key] = _build(grid, access_cells(grid, cell))
+    return _FIELDS[key]
 
 
 def _build(grid, goals):
@@ -88,7 +81,8 @@ def _build(grid, goals):
         here = steps[y * width + x]
         for dx, dy in DIRS:
             nx, ny = x + dx, y + dy
-            if 0 <= nx < width and 0 <= ny < height and steps[ny * width + nx] == UNREACHABLE                     and is_walkable(grid, nx, ny):
+            if (0 <= nx < width and 0 <= ny < height
+                    and steps[ny * width + nx] == UNREACHABLE and is_walkable(grid, nx, ny)):
                 steps[ny * width + nx] = here + 1
                 frontier.append((nx, ny))
     return Field(width, height, steps)

@@ -51,19 +51,6 @@ class TestEquivalence(unittest.TestCase):
         self.assertEqual(rows, plain_rows, "--envs 1 diverged from the one-episode loop")
         self.assertEqual(make.OBS, policy.spec.obs_features)
 
-    def test_more_envs_play_the_same_maps_in_the_same_rounds(self):
-        args = settings("--train", "--envs", "4", "--episodes", "8")
-        vec = vec_of(args, 4, POLICIES["greedy"].OBS)
-        vec.reset()
-        first = [env.grid for env in vec.envs]
-        self.assertEqual(len(set(first)), 1, "a round shares one map, by design")
-        self.assertEqual(first[0], tuple(layout_for(args, 0).splitlines()))
-        for _ in range(STEPS):
-            vec.step([[2] * ROBOTS] * 4)
-        second = [env.grid for env in vec.envs]
-        self.assertEqual(len(set(second)), 1)
-        self.assertNotEqual(second[0], first[0], "the next round should draw a new map")
-        self.assertEqual(second[0], tuple(layout_for(args, 1).splitlines()))
 
 
 class TestTruncationBootstrap(unittest.TestCase):

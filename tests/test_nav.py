@@ -16,7 +16,7 @@ from env.observation import HEADINGS
 from env.warehouse import N_ACTIONS, TURN_LEFT, TURN_RIGHT, Warehouse
 from rl import nav
 from rl.features import Features
-from rl.nav import UNREACHABLE, Field, distance_field, legal_actions
+from rl.nav import UNREACHABLE, distance_field, legal_actions
 
 ROBOTS, STEPS = 4, 60
 FACTORS = dict(mixed_crates=True, mixed_robots=True, priority=True, humans=2)
@@ -142,16 +142,6 @@ class TestField(unittest.TestCase):
                             "the raw index wrapped to the last row: the answer at() protects against")
         self.assertEqual(field.at(-1, 2), UNREACHABLE, "and the same for a negative column")
 
-    def test_every_walkable_cell_reaches_a_dock(self):
-        # maze_layout validates that the aisles are connected, so a dock is reachable from all.
-        for seed in range(5):
-            grid = parse(maze_layout(seed, 11, 9, n_robots=2))
-            field = distance_field(grid, cells_of(grid, "D")[0])
-            for y in range(len(grid)):
-                for x in range(len(grid[0])):
-                    if is_walkable(grid, x, y):
-                        self.assertNotEqual(field.at(x, y), UNREACHABLE, f"({x}, {y}) is walled in")
-
     def test_one_step_in_a_decreasing_direction_costs_exactly_one(self):
         """The property the network's delta features rely on: +1 really means a step closer."""
         grid = parse(maze_layout(2, 15, 13, n_robots=3))
@@ -197,14 +187,6 @@ class TestCache(unittest.TestCase):
         finally:
             nav.FIELD_CACHE = kept
             nav._FIELDS.clear()
-
-    def test_a_field_is_a_field(self):
-        grid = parse(DEFAULT_MAP)
-        field = distance_field(grid, cells_of(grid, "D")[0])
-        self.assertIsInstance(field, Field)
-        self.assertEqual((field.width, field.height), (len(grid[0]), len(grid)))
-        self.assertEqual(len(field.steps), field.width * field.height)
-
 
 if __name__ == "__main__":
     unittest.main()

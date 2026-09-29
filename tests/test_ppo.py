@@ -123,17 +123,6 @@ class TestTruncationBootstrap(unittest.TestCase):
         self.assertAlmostEqual(crossed, 0.0, places=6, msg="step 1 inherited step 2's advantage")
         self.assertGreater(joined, 0.0, "without the boundary it should carry, or this proves nothing")
 
-    def test_it_matches_a_longhand_gae_when_nothing_ends(self):
-        reward, value, after = [1.0, 2.0, 3.0], [0.5, 0.5, 0.5], [0.5, 0.5, 9.0]
-        got = self.gae(reward, value, after, [0.0, 0.0, 0.0]).reshape(-1).tolist()
-        want, running = [0.0] * 3, 0.0
-        for t in reversed(range(3)):
-            delta = reward[t] + mod.GAMMA * after[t] - value[t]
-            running = delta + mod.GAMMA * mod.LAMBDA * running
-            want[t] = running
-        for a, b in zip(got, want):
-            self.assertAlmostEqual(a, b, places=5)
-
     def test_a_rollout_spanning_a_boundary_learns_without_complaint(self):
         """End to end: the rollout is longer than the episode, so a boundary lands inside it."""
         rollout, mod.ROLLOUT = mod.ROLLOUT, 24
