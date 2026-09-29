@@ -1,26 +1,20 @@
 """Central agent: ONE network decides every robot's move, from every robot's observation.
 
-Centralized training with parameter sharing (CTDE). Every robot goes through the same trunk,
+Centralized training with parameter sharing (CTDE). Every robot goes through the same weights,
 and its input carries a pooled summary of the whole fleet, so each decision is made with the
-team in view. The net scores one Q-value per action for one robot, and is trained on that
-robot's OWN reward: the env already hands back a per-robot reward vector (and already shares
-half of it between robots through its `alpha`), so summing it into a single team number, as a
-VDN would, throws away the only signal that says WHICH robot wasted its move.
+team in view. The net scores one Q-value per action for one robot and is trained on that robot's
+OWN reward: the env already hands back a per-robot reward vector (and already shares half of it
+between robots through its `alpha`, so sum(rewards) == sum(own) exactly). Summing it again into
+one team number, as a VDN would, therefore adds no information and destroys the only signal that
+says WHICH robot wasted its move.
 
-Three things make the warehouse learnable at all, and each is worth knowing about:
-
-  * A legality mask (`legal_actions`). The env silently ignores an impossible action and fines
-    it, so without a mask the net spends Q-values on moves that can never happen and the
-    bootstrap keeps believing in them.
-  * BFS distance features. A small MLP cannot work out shortest paths through a maze from
-    coordinates and rays. GreedyRule computes the same field. --policy-opt bfs=0 removes them.
-  * Distance-based reward shaping. A delivery is ~50 steps of correct play away, far too rare to
-    stumble into, so the net is also paid for getting closer. The bonus telescopes over any run
-    of steps (see learning_rewards), so circling cannot farm it, and it is added only to what the
-    net learns from: every number the env reports is untouched. --policy-opt shaping=0.
+Three things make the warehouse learnable at all. Each is argued where it is implemented:
+the legality mask and the shortest-path features in rl/nav.py, and the reward shaping in
+learning_rewards below. Both feature groups have an ablation switch, --policy-opt bfs=0 and
+--policy-opt shaping=0.
 
 A greedy teacher plays a fading share of the moves, never dropping below EXPERT_FLOOR, so the
-memory box always holds real deliveries to learn from (DQN is off-policy).
+memory always holds real deliveries to learn from (DQN is off-policy).
 
 Because the net's shape depends on neither the robot count nor the map size, a checkpoint
 trained on a small scenario loads straight into a bigger one.
@@ -55,7 +49,9 @@ EPS_START, EPS_END, EPS_STEPS = 0.3, 0.05, 150_000
 # part of the rule rather than exploration, so it stays on in evaluation; it is drawn from a
 # separate, per-episode stream so evaluating never disturbs the training trajectory.
 EVAL_EPS = 0.05
-VIEW, RAY_TYPES = 5, HUMAN + 1                  # ray range, and the number of ray types (0 = nothing .. 6 = human)
+# VIEW mirrors Warehouse(view_range=5); nothing in the repo passes another value and EnvSpec
+# does not carry it, so a scenario that changed it would push dist / VIEW quietly past 1.0.
+VIEW, RAY_TYPES = 5, HUMAN + 1                  # ray range, and the ray types (0 = nothing .. 6 = human)
 NEG = -1e9                                      # Q of an impossible action: beaten by any real one, never -inf
 
 # Rewards reach +30 for a delivery, which would sit far outside the Huber loss's quadratic part
@@ -91,21 +87,23 @@ class CentralDQN(Policy):
         super().__init__(spec, seed)
         self.rng = random.Random(seed)              # choosing actions while training
         self.replay_rng = random.Random(seed + 1)   # sampling the memory, so the two never interleave
-        self.eval_rng = random.Random(seed + 2)     # reseeded per episode, see reset()
+        self.eval_rng = random.Random(seed)         # replaced every eval episode, see reset()
         self.expert = GreedyRule(spec, seed)
         self.use_bfs, self.use_shaping = True, True
         self.memory, self.steps, self.updates, self.loss_ema = [], 0, 0, 0.0
-        self._measure_map()
+        self.w, self.h = len(spec.grid[0]), len(spec.grid)
         self._build()
 
     def configure(self, bfs=None, shaping=None, **unknown):
         if unknown:
             raise ValueError(f"unknown setting {', '.join(sorted(unknown))}; this policy takes bfs, shaping")
+        before = (self.use_bfs, self.use_shaping)
         if bfs is not None:
             self.use_bfs = _flag(bfs, "bfs")
         if shaping is not None:
             self.use_shaping = _flag(shaping, "shaping")
-        self._build()       # bfs changes how wide a robot's feature vector is
+        if (self.use_bfs, self.use_shaping) != before:
+            self._build()   # bfs changes how wide a robot's feature vector is
 
     def _build(self):
         """(Re)create the net. The input is one robot's features plus the fleet's mean of them."""
@@ -120,12 +118,9 @@ class CentralDQN(Policy):
         cls = obs_type(tuple(self.spec.obs_features))
         return cls(*([0] * len(cls._fields)))
 
-    def _measure_map(self):
-        self.w, self.h = len(self.spec.grid[0]), len(self.spec.grid)
-
     def reset(self):
         self.expert.spec = self.spec
-        self._measure_map()
+        self.w, self.h = len(self.spec.grid[0]), len(self.spec.grid)
         if not self.training:
             # Evaluation gets its own fresh stream, so measuring the policy leaves the training
             # trajectory bit-for-bit unchanged and every eval of a given net is reproducible.
@@ -239,8 +234,9 @@ class CentralDQN(Policy):
     def potential(self, o):
         """Phi(s) for one robot: nearer to its target is better, and facing it is better still.
 
-        A function of the state alone, which is what makes the shaping potential-based and so
-        leaves the optimal policy unchanged.
+        A function of the state alone. That is what makes the shaping potential-based; it is NOT
+        enough to make it policy-invariant, because learning_rewards uses the plain difference
+        rather than Ng, Harada and Russell's discounted form. See the argument there.
         """
         if not o.has_task:
             return 0.0
@@ -253,16 +249,18 @@ class CentralDQN(Policy):
         return torch.tensor([self.robot_features(o) for o in obs], dtype=torch.float32)
 
     def robot_features(self, o):
+        """One robot's input row. Every feature here is one that some action can change.
+
+        Crate size, robot capacity, raw task age, Manhattan distance and a per-ray "nothing in
+        range" flag were all dropped as unactionable or redundant; TestDroppedFeatures in
+        tests/test_central_dqn.py holds the env properties that make them so, so re-adding one
+        means first breaking a test that says why not.
+        """
         dx, dy = o.target_x - o.x, o.target_y - o.y
-        v = [o.x / self.w, o.y / self.h,
-             dx / self.w, dy / self.h, (abs(dx) + abs(dy)) / (self.w + self.h),
+        v = [o.x / self.w, o.y / self.h, dx / self.w, dy / self.h,
              float(o.carrying), float(o.has_task), float(self.faces_target(o)),
-             o.crate_weight / 3, o.crate_volume / 3,
              o.priority / 3, self.task_value(o) / 3,
-             # Raw task_age drifts upward exactly when the agent is failing, so the net would be
-             # learning from a moving target. What the reward actually depends on is the value.
-             min(o.task_age, 300) / 100,
-             float(o.ready), float(max(o.period - 1, 0)), o.max_weight / 3, o.max_volume / 3]
+             float(o.ready), float(max(o.period - 1, 0))]
         v += one_hot(o.heading, 4)
         for dist, kind in ((o.front_d, o.front_t), (o.right_d, o.right_t),
                            (o.back_d, o.back_t), (o.left_d, o.left_t)):
@@ -271,7 +269,7 @@ class CentralDQN(Policy):
             # conjunction "this type AND this range" is spread across a one-hot and a distance,
             # so the single fact that matters gets its own feature.
             occupied = float(dist == 1 and kind in (ROBOT, HUMAN))
-            v += [dist / VIEW, float(dist == 0), occupied] + one_hot(kind, RAY_TYPES)
+            v += [dist / VIEW, occupied] + one_hot(kind, RAY_TYPES)
         if self.use_bfs:
             near, deltas = self.distance_features(o)
             v += [near] + deltas
@@ -315,12 +313,14 @@ class CentralDQN(Policy):
     def save(self, folder):
         """Everything needed to carry on training, not just to replay.
 
-        Without the target net, the optimizer and `steps`, resuming with --train would restart
-        the teacher at 100% and throw away Adam's momentum. The replay memory is deliberately
-        left out: it is hundreds of megabytes, and the teacher refills it within an episode.
+        Without the optimizer and `steps`, resuming with --train would restart the teacher at
+        full strength and throw away Adam's momentum. Two things are left out on purpose: the
+        replay memory, which is hundreds of megabytes and which the teacher refills within an
+        episode, and the target net, which load() copies from net.pt. A resumed run therefore
+        starts from a target that is fresh rather than up to TARGET_EVERY updates stale, which
+        washes out within the first 500 updates and is not worth doubling the checkpoint for.
         """
         torch.save(self.net.state_dict(), folder / "net.pt")
-        torch.save(self.target.state_dict(), folder / "target.pt")
         torch.save(self.opt.state_dict(), folder / "opt.pt")
         state = {"bfs": self.use_bfs, "shaping": self.use_shaping, "steps": self.steps,
                  "updates": self.updates, "loss_ema": self.loss_ema}
@@ -333,6 +333,6 @@ class CentralDQN(Policy):
             self.use_bfs, self.use_shaping = state["bfs"], state["shaping"]
             self._build()
         self.net.load_state_dict(torch.load(folder / "net.pt", weights_only=True))
-        self.target.load_state_dict(torch.load(folder / "target.pt", weights_only=True))
+        self.target.load_state_dict(self.net.state_dict())
         self.opt.load_state_dict(torch.load(folder / "opt.pt", weights_only=True))
         self.steps, self.updates, self.loss_ema = state["steps"], state["updates"], state["loss_ema"]
