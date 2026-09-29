@@ -28,6 +28,9 @@ def make_parser(description=None, parser_class=argparse.ArgumentParser):
 
 def add_common_args(parser):
     parser.add_argument("--policy", help=f"one of: {', '.join(POLICIES)} (default greedy)")
+    parser.add_argument("--policy-opt", action="append", default=None, metavar="KEY=VALUE",
+                        help="a setting for the algorithm itself, repeatable (e.g. --policy-opt bfs=0);\n"
+                             "a checkpoint remembers the ones it was trained with")
     parser.add_argument("--checkpoint", metavar="FOLDER", help="load trained weights (and their settings)")
     parser.add_argument("--scenario", help=f"preset of the flags below: {', '.join(SCENARIOS)}")
     parser.add_argument("--seed", type=int, default=0, help="episode k uses seed + k")
@@ -59,7 +62,7 @@ def parse(parser, argv=None, env_from_checkpoint=True):
     entry must play exactly the same env, whatever it was trained on).
     """
     pre, _ = parser.parse_known_args(argv)
-    defaults = {}
+    defaults, trained_opts = {}, {}
     if pre.checkpoint:
         try:
             meta = read_meta(pre.checkpoint)
@@ -67,6 +70,7 @@ def parse(parser, argv=None, env_from_checkpoint=True):
             parser.error(str(err))
         if env_from_checkpoint:
             defaults.update(meta.get("env_args", {}))
+        trained_opts = meta.get("policy_opts") or {}
         defaults["policy"] = meta["policy"]
     if pre.scenario:
         if pre.scenario not in SCENARIOS:
@@ -75,7 +79,23 @@ def parse(parser, argv=None, env_from_checkpoint=True):
     parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
     args.policy = args.policy or "greedy"
+    try:
+        # A typed --policy-opt wins over the one the checkpoint was trained with.
+        args.policy_opts = {**trained_opts, **parse_policy_opts(args.policy_opt)}
+    except ValueError as err:
+        parser.error(str(err))
     return args
+
+
+def parse_policy_opts(entries):
+    """["bfs=0", "shaping=1"] -> {"bfs": "0", "shaping": "1"}. Values stay strings; the policy reads them."""
+    opts = {}
+    for entry in entries or []:
+        key, sep, value = entry.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--policy-opt wants KEY=VALUE, got '{entry}'")
+        opts[key.strip()] = value.strip()
+    return opts
 
 
 def env_args(args):
@@ -105,6 +125,11 @@ def build(args):
                     mixed_crates=args.mixed_crates, mixed_robots=args.mixed_robots,
                     priority=args.priority, humans=args.humans)
     policy = make(env.spec, args.seed)
+    opts = getattr(args, "policy_opts", None) or {}
+    try:
+        policy.configure(**opts)
+    except ValueError as err:
+        raise ValueError(f"--policy-opt for '{args.policy}': {err}") from err
     if args.checkpoint:
         load_checkpoint(policy, args.checkpoint, args.policy)
     return env, policy

@@ -13,12 +13,13 @@ from env.warehouse import CONTRACT_VERSION
 META = "meta.json"
 
 
-def save_checkpoint(policy, folder, name, n_robots, env_args=None, episode=None):
+def save_checkpoint(policy, folder, name, n_robots, env_args=None, episode=None, policy_opts=None):
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     policy.save(folder)
     meta = {"policy": name, "contract_version": CONTRACT_VERSION, "n_robots": n_robots,
-            "obs": list(policy.spec.obs_features), "env_args": env_args or {}, "episode": episode}
+            "obs": list(policy.spec.obs_features), "env_args": env_args or {},
+            "policy_opts": policy_opts or {}, "episode": episode}
     (folder / META).write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 

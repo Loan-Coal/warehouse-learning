@@ -19,7 +19,10 @@ from rl.checkpoint import save_checkpoint
 from rl.cli import build_or_exit, env_args, layout_for, make_parser, parse
 from rl.loop import run_episode
 
-LOG_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return")
+# Append-only: older logs without the later columns still read back, and the first six
+# columns keep their meaning and order for anything that reads them by position.
+LOG_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return",
+              "mode", "epsilon", "p_expert", "loss")
 
 
 def main():
@@ -30,6 +33,12 @@ def main():
                         help="with --save: also keep a checkpoint every N episodes, to replay later")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--print-every", type=int, default=1, metavar="N", help="print every N-th episode")
+    parser.add_argument("--eval-every", type=int, default=0, metavar="N",
+                        help="with --train: every N episodes, play --eval-episodes without learning,\n"
+                             "exploration or a teacher. This is the curve that shows what the net learned")
+    parser.add_argument("--eval-episodes", type=int, default=5, metavar="K")
+    parser.add_argument("--eval-seed", type=int, default=90_000,
+                        help="evaluation episodes use eval-seed + j, held out from training's seed + k")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--delay", type=float, default=0.15, help="seconds between rendered steps")
     args = parse(parser)
@@ -39,6 +48,10 @@ def main():
         parser.error("--save only makes sense with --train")
     if args.snapshot_every and not args.save:
         parser.error("--snapshot-every needs --save")
+    if args.eval_every and not args.train:
+        parser.error("--eval-every needs --train (without it every episode is already an evaluation)")
+    if args.eval_every < 0 or args.eval_episodes < 1:
+        parser.error("--eval-every must be at least 0 and --eval-episodes at least 1")
     env, policy = build_or_exit(parser, args)
 
     def show(*_):
@@ -53,22 +66,41 @@ def main():
             parser.error(str(err))
         stats = run_episode(env, policy, args.seed + k, args.train, None if args.no_render else show, layout)
         if log:
-            log.write(k, stats)
+            log.write(k, dict(stats, **policy.stats()))
         if (k + 1) % args.print_every == 0 or k == args.episodes - 1:
             print(f"episode {k}: deliveries {stats['deliveries']}  value {stats['value']:.1f}  "
                   f"blocked {stats['blocked']}  invalid {stats['invalid']}  mean return {stats['mean_return']:.2f}")
+        if args.eval_every and (k + 1) % args.eval_every == 0:
+            evaluate(env, policy, args, k, log)
         if args.snapshot_every and (k + 1) % args.snapshot_every == 0:
             save_checkpoint(policy, Path(args.save) / f"ep_{k + 1:06d}", args.policy, env.n_robots,
-                            env_args(args), episode=k + 1)
+                            env_args(args), episode=k + 1, policy_opts=args.policy_opts)
     if log:
         log.close()
     if args.save:
-        save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args), episode=args.episodes)
+        save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args),
+                        episode=args.episodes, policy_opts=args.policy_opts)
         print(f"saved checkpoint to {args.save}")
 
 
+def evaluate(env, policy, args, episode, log):
+    """Play held-out episodes with learning, exploration and any teacher switched off.
+
+    run_episode(train=False) sets policy.training = False and never calls update(), so this
+    measures the policy alone. The seeds are disjoint from training's, and the map is untouched.
+    """
+    rows = [run_episode(env, policy, args.eval_seed + j, train=False)
+            for j in range(args.eval_episodes)]
+    if log:
+        for row in rows:
+            log.write(episode, row, mode="eval")
+    mean = {m: sum(r[m] for r in rows) / len(rows) for m in ("deliveries", "invalid", "mean_return")}
+    print(f"  eval @ {episode + 1}: deliveries {mean['deliveries']:.1f}  "
+          f"invalid {mean['invalid']:.0f}  mean return {mean['mean_return']:.2f}")
+
+
 class TrainLog:
-    """FOLDER/train_log.csv: one row per training episode, for rl.plot."""
+    """FOLDER/train_log.csv: one row per episode, for rl.plot. mode is "train" or "eval"."""
 
     def __init__(self, folder):
         Path(folder).mkdir(parents=True, exist_ok=True)
@@ -76,11 +108,20 @@ class TrainLog:
         self.writer = csv.writer(self.file)
         self.writer.writerow(LOG_FIELDS)
 
-    def write(self, episode, stats):
-        self.writer.writerow([episode] + [round(stats[k], 4) for k in LOG_FIELDS[1:]])
+    def write(self, episode, stats, mode="train"):
+        row = dict(stats, mode=mode)
+        self.writer.writerow([episode] + [_cell(row.get(k)) for k in LOG_FIELDS[1:]])
+        self.file.flush()   # so rl.plot works on a run that is still going
 
     def close(self):
         self.file.close()
+
+
+def _cell(value):
+    """A metric the policy did not report becomes an empty cell, not a crash."""
+    if value is None:
+        return ""
+    return round(value, 4) if isinstance(value, float) else value
 
 
 if __name__ == "__main__":

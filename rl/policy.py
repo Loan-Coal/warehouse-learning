@@ -43,6 +43,15 @@ class Policy:
     def reset(self) -> None:
         """Called at the start of every episode."""
 
+    def configure(self, **opts) -> None:
+        """Apply --policy-opt settings. Called once, before any checkpoint is loaded."""
+        if opts:
+            raise ValueError(f"policy takes no --policy-opt: {', '.join(sorted(opts))}")
+
+    def stats(self) -> dict:
+        """Extra scalars for train_log.csv (epsilon, loss...). Unknown keys are ignored."""
+        return {}
+
     def save(self, folder: Path) -> None:
         """Write plain files (JSON, torch state_dict) into folder, which already exists."""
 
@@ -67,6 +76,13 @@ class RobotPolicy:
 
     def reset(self) -> None:
         pass
+
+    def configure(self, **opts) -> None:
+        if opts:
+            raise ValueError(f"policy takes no --policy-opt: {', '.join(sorted(opts))}")
+
+    def stats(self) -> dict:
+        return {}
 
     def save(self, folder: Path) -> None:
         pass
@@ -135,6 +151,13 @@ class _PerRobot(Policy):
     def reset(self):
         for robot in self.distinct:
             robot.reset()
+
+    def configure(self, **opts):
+        for robot in self.distinct:
+            robot.configure(**opts)
+
+    def stats(self):
+        return self.distinct[0].stats()
 
     def save(self, folder):
         for sub, robot in self._folders(folder):
