@@ -20,6 +20,7 @@ from env.scenarios import SCENARIOS
 from rl.checkpoint import save_checkpoint
 from rl.cli import build_or_exit, env_args, layout_for, make_env, make_parser, parse, train_seeds
 from rl.loop import run_episode
+from rl.vecloop import train_vec
 
 # Append-only: older logs without the later columns still read back, and the first six
 # columns keep their meaning and order for anything that reads them by position.
@@ -35,6 +36,12 @@ def build_parser():
     parser.add_argument("--snapshot-every", type=int, default=0, metavar="N",
                         help="with --save: also keep a checkpoint every N episodes, to replay later")
     parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--envs", type=int, default=1, metavar="N",
+                        help="train with N envs stepped together, so one network call serves all\n"
+                             "of them (rl/vecloop.py). 1 keeps the plain one-episode loop")
+    parser.add_argument("--total-steps", type=int, default=0, metavar="N",
+                        help="with --envs: also stop after N env steps, whichever comes first.\n"
+                             "This is the budget to size a run by; --episodes can stay large")
     parser.add_argument("--print-every", type=int, default=1, metavar="N", help="print every N-th episode")
     parser.add_argument("--eval-every", type=int, default=0, metavar="N",
                         help="with --train: every N episodes, play --eval-episodes without learning,\n"
@@ -66,13 +73,22 @@ def check_args(parser, args):
         parser.error("--eval-every needs --train (without it every episode is already an evaluation)")
     if args.eval_every < 0 or args.eval_episodes < 1:
         parser.error("--eval-every must be at least 0 and --eval-episodes at least 1")
+    if args.envs < 1 or args.total_steps < 0:
+        parser.error("--envs must be at least 1 and --total-steps at least 0")
+    if args.envs > 1 and not args.train:
+        parser.error("--envs only speeds up training; an evaluation plays one episode at a time")
+    if args.envs > 1 and not args.no_render:
+        parser.error("--envs cannot be rendered in the terminal: add --no-render")
+    if args.total_steps and args.envs == 1:
+        parser.error("--total-steps needs --envs (the plain loop counts episodes)")
     if args.eval_scenario and args.eval_scenario not in SCENARIOS:
         parser.error(f"unknown --eval-scenario '{args.eval_scenario}'; in env/scenarios.py: "
                      f"{', '.join(SCENARIOS)}")
     if args.eval_every:
         # Held out means held out. Without this check a long --new-map run walks its layout seeds
         # straight into the evaluation range and quietly starts training on the eval mazes.
-        train_lo, train_hi = train_seeds(args, args.episodes)
+        rounds = -(-args.episodes // args.envs)     # a map per round of --envs episodes
+        train_lo, train_hi = train_seeds(args, rounds)
         eval_lo, eval_hi = args.eval_seed, args.eval_seed + args.eval_episodes - 1
         if train_lo <= eval_hi and eval_lo <= train_hi:
             parser.error(f"training maps (seeds {train_lo}-{train_hi}) overlap the evaluation maps "
@@ -91,6 +107,15 @@ def main():
         time.sleep(args.delay)
 
     log = TrainLog(args.save) if args.save else None
+    if args.envs > 1:
+        train_vec(args, env, policy, log, lambda episode: evaluate(env, policy, args, episode, log))
+        if log:
+            log.close()
+        if args.save:
+            save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args),
+                            episode=args.episodes, policy_opts=args.policy_opts)
+            print(f"saved checkpoint to {args.save}")
+        return
     for k in range(args.episodes):
         try:
             layout = layout_for(args, k) if args.new_map else None

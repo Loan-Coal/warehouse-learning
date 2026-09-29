@@ -43,6 +43,24 @@ class Policy:
     def reset(self) -> None:
         """Called at the start of every episode."""
 
+    def act_vec(self, obs: list[list[Obs]]) -> list[list[int]]:
+        """Actions for several envs at once: one observation list per env, in the same order.
+
+        Optional. The default plays them one env at a time, which is correct but gives up the
+        only reason rl/vecloop.py exists -- override it to put every robot of every env through
+        a single forward pass. Nothing else about your policy has to change.
+        """
+        return [self.act(one) for one in obs]
+
+    def update_vec(self, obs, actions, rewards, next_obs, dones) -> None:
+        """update() for several envs at once. Same arguments, each a list indexed by env.
+
+        next_obs is the real successor of each transition, so in a slot whose episode just ran
+        out of time it is the observation that episode ENDED on, not the restarted one.
+        """
+        for step in zip(obs, actions, rewards, next_obs, dones):
+            self.update(*step)
+
     def configure(self, **opts) -> None:
         """Apply --policy-opt settings. Called once, before any checkpoint is loaded."""
         if opts:
