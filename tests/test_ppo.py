@@ -212,6 +212,49 @@ class TestUpdate(unittest.TestCase):
                          [mod.REWARD_SCALE * 2.0] * ROBOTS, "same state, so no shaping either way")
 
 
+class TestStoredAndRecomputed(unittest.TestCase):
+    """Before the first gradient step the policy has not moved, so the ratio must be exactly 1.
+
+    This is the check that catches a whole family of silent mistakes at once: a mask built from
+    the wrong map at learn time, features rebuilt in a different order, the stored action not
+    being the one the log-probability was taken for. Any of those leaves PPO training on a
+    corrupted objective while every number still looks plausible -- the ratio simply stops being
+    1 at the start, clipping fires immediately, and learning quietly degrades.
+    """
+
+    def test_the_ratio_is_one_before_the_first_update(self):
+        rollout, mod.ROLLOUT = mod.ROLLOUT, 1_000_000       # never fires on its own
+        try:
+            vec = vec_of(3)
+            policy = PPO(vec.envs[0].spec, seed=0)
+            play(policy, vec, STEPS + 5)                    # spans an episode boundary and a map change
+            self.assertGreater(len(policy.rollout), STEPS)
+
+            x, mask, acted, logp = [torch.stack(p) for p in list(zip(*policy.rollout))[:4]]
+            with torch.no_grad():
+                logits = policy.actor(pooled(x.flatten(0, 1))).masked_fill(~mask.flatten(0, 1),
+                                                                          mod.NEG)
+                again = torch.distributions.Categorical(logits=logits).log_prob(acted.flatten(0, 1))
+            ratio = (again - logp.flatten(0, 1)).exp()
+            self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-5),
+                            f"ratio drifted from 1: min {ratio.min():.6f} max {ratio.max():.6f}")
+        finally:
+            mod.ROLLOUT = rollout
+
+    def test_a_stored_action_is_always_one_the_mask_allowed(self):
+        rollout, mod.ROLLOUT = mod.ROLLOUT, 1_000_000
+        try:
+            vec = vec_of(3)
+            policy = PPO(vec.envs[0].spec, seed=0)
+            play(policy, vec, STEPS + 5)
+            for step in policy.rollout:
+                mask, acted = step[1], step[2]
+                chosen = torch.gather(mask, -1, acted.unsqueeze(-1)).squeeze(-1)
+                self.assertTrue(chosen.all(), "an illegal action was stored to learn from")
+        finally:
+            mod.ROLLOUT = rollout
+
+
 class TestTransfer(unittest.TestCase):
     def test_the_networks_do_not_depend_on_the_fleet_or_the_map(self):
         shapes = set()
