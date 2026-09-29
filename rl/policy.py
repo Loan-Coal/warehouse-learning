@@ -130,6 +130,11 @@ class _PerRobot(Policy):
         self._spec = spec
         for robot in getattr(self, "distinct", []):
             robot.spec = spec
+        if getattr(self, "is_shared", False):
+            # One set of weights fits any fleet size, so follow a robot count that changed with
+            # the spec (rl.run evaluates with --eval-robots). An independent() policy cannot:
+            # it has exactly one instance per robot, fixed when it was built.
+            self.robots = self.distinct * spec.n_robots
 
     @property
     def training(self):

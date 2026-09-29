@@ -46,6 +46,11 @@ def add_common_args(parser):
     parser.add_argument("--max-steps", type=int, default=100, help="episode length")
     parser.add_argument("--new-map", action="store_true",
                         help="with --maze or --random-map: a new map every episode (seed + k)")
+    parser.add_argument("--maze-pool", type=int, default=0, metavar="P",
+                        help="with --new-map: cycle through P maps instead of a fresh one every\n"
+                             "episode. A policy that caches anything per map (shortest-path\n"
+                             "fields) then gets a warm cache, and the training seeds stay inside a\n"
+                             "known range. 0 = a new map every episode")
     factors = parser.add_argument_group("complexity factors (all off by default)")
     factors.add_argument("--mixed-crates", action="store_true", help="crates get a weight and volume 1-3")
     factors.add_argument("--mixed-robots", action="store_true",
@@ -104,8 +109,14 @@ def env_args(args):
 
 
 def layout_for(args, episode):
-    """The map for episode k: a fixed map, or a new one per episode with --new-map."""
-    seed = args.seed + episode if args.new_map else args.seed
+    """The map for episode k: a fixed map, or a new one per episode with --new-map.
+
+    --maze-pool P cycles through P maps instead of a fresh one every episode, which bounds the
+    layout seeds this run can reach. train_seeds() reports that range, so rl.run can prove the
+    training maps are disjoint from the held-out evaluation ones.
+    """
+    pool = getattr(args, "maze_pool", 0)
+    seed = args.seed + (episode % pool if pool else episode) if args.new_map else args.seed
     if args.map == "maze":
         return maze_layout(seed, *args.size, n_robots=args.robots)
     if args.map == "random":
@@ -115,15 +126,28 @@ def layout_for(args, episode):
     return DEFAULT_MAP
 
 
+def train_seeds(args, episodes):
+    """The inclusive range of layout seeds `episodes` training episodes can reach."""
+    if not args.new_map:
+        return args.seed, args.seed
+    pool = getattr(args, "maze_pool", 0) or episodes
+    return args.seed, args.seed + min(episodes, pool) - 1
+
+
+def make_env(args, obs, layout):
+    """A Warehouse from the env flags, on a given map, observing what the policy asked for."""
+    return Warehouse(layout, n_robots=args.robots, max_steps=args.max_steps, obs=obs,
+                     mixed_crates=args.mixed_crates, mixed_robots=args.mixed_robots,
+                     priority=args.priority, humans=args.humans)
+
+
 def build(args):
     """(env, policy) from parsed args. Raises ValueError with a readable message on bad settings."""
     if args.policy not in POLICIES:
         raise ValueError(f"unknown policy '{args.policy}'; registered in rl/policies/__init__.py: "
                          f"{', '.join(POLICIES)}")
     make = POLICIES[args.policy]
-    env = Warehouse(layout_for(args, 0), n_robots=args.robots, max_steps=args.max_steps, obs=make.OBS,
-                    mixed_crates=args.mixed_crates, mixed_robots=args.mixed_robots,
-                    priority=args.priority, humans=args.humans)
+    env = make_env(args, make.OBS, layout_for(args, 0))
     policy = make(env.spec, args.seed)
     opts = getattr(args, "policy_opts", None) or {}
     try:
