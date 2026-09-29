@@ -11,6 +11,10 @@ from env.layout import DIRS, access_cells, is_walkable
 from env.warehouse import (BACKWARD, DROPOFF, FORWARD, HEADINGS, N_ACTIONS, PICKUP, TURN_LEFT,
                            TURN_RIGHT)
 
+# A turn is always legal (env/warehouse.py never fines one), so it is the safe fallback for
+# field_action whenever the field has nothing to say.
+SAFE = TURN_RIGHT
+
 UNREACHABLE = -1
 
 # Distance fields kept across all maps and targets. One is ~1.8 KB at 21x21, so 20k is ~36 MB and
@@ -81,6 +85,36 @@ def distance_field(grid, cell):
         field = _FIELDS[key] = _build(grid, access_cells(grid, cell))
         return field
     return field
+
+
+def field_action(grid, o, legal):
+    """The move the shortest-path field implies for one robot. Always a legal action.
+
+    GreedyRule answers the same question well, but runs a fresh BFS per robot per step to do it.
+    This reads the field the features already built, so using it as a teacher costs nothing. It
+    is a weaker teacher on purpose: it does not look at the other robots at all, which is
+    precisely the part a learner is supposed to improve on.
+    """
+    if legal[PICKUP]:
+        return PICKUP
+    if legal[DROPOFF]:
+        return DROPOFF
+    if not o.has_task:
+        return SAFE
+    field = distance_field(grid, (o.target_x, o.target_y))
+    here = field.at(o.x, o.y)
+    if here == UNREACHABLE:
+        return SAFE
+    nearest, quarter = here, None
+    for turn in range(4):
+        dx, dy = HEADINGS[(o.heading + turn) % 4]
+        there = field.at(o.x + dx, o.y + dy)
+        if there != UNREACHABLE and there < nearest:
+            nearest, quarter = there, turn
+    if quarter is None:
+        return SAFE
+    move = (FORWARD, TURN_RIGHT, BACKWARD, TURN_LEFT)[quarter]
+    return move if legal[move] else SAFE
 
 
 def _build(grid, goals):

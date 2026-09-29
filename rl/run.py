@@ -25,7 +25,8 @@ from rl.vecloop import train_vec
 # Append-only: older logs without the later columns still read back, and the first six
 # columns keep their meaning and order for anything that reads them by position.
 LOG_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return",
-              "mode", "epsilon", "p_expert", "loss")
+              "mode", "epsilon", "p_expert", "loss",
+              "entropy", "clipfrac", "explained_var")
 
 
 def build_parser():

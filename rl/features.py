@@ -14,6 +14,8 @@ rays are local, so the row is the same width for a 4-robot 11x9 warehouse as for
 21x21 one, and the pooled fleet summary the networks add (see the policies) is a mean rather
 than a concatenation. That is what lets one checkpoint play a scenario it never trained on.
 """
+import os
+
 import torch
 
 from env.observation import HEADINGS, obs_type
@@ -23,6 +25,11 @@ from rl.nav import UNREACHABLE, distance_field
 # VIEW mirrors Warehouse(view_range=5). Nothing in the repo passes another value and EnvSpec does
 # not carry it, so a scenario that changed it would push dist / VIEW quietly past 1.0.
 VIEW, RAY_TYPES = 5, HUMAN + 1          # ray range, and the ray types (0 = nothing .. 6 = human)
+
+# The batches here are small enough that torch spends more time handing work to threads than
+# doing it. Measured on a 16-thread machine: 0.46 s/episode at 8 threads against 0.54 at 16 and
+# 0.77 at 1. Set here because this is the module both policies import torch through.
+torch.set_num_threads(min(8, os.cpu_count() or 1))
 
 
 def one_hot(k, n):

@@ -20,7 +20,6 @@ Because the net's shape depends on neither the robot count nor the map size, a c
 trained on a small scenario loads straight into a bigger one.
 """
 import json
-import os
 import random
 
 import torch
@@ -32,11 +31,6 @@ from rl.features import Features, target_changed
 from rl.nav import legal_actions
 from rl.policies.greedy import GreedyRule
 from rl.policy import Policy, flag
-
-# The batches here are tiny (a few hundred rows through 256-wide layers), so torch spends more
-# time handing work to threads than doing it. Measured on a 16-thread machine: 0.46 s/episode at
-# 8 threads against 0.54 at 16 and 0.77 at 1.
-torch.set_num_threads(min(8, os.cpu_count() or 1))
 
 GAMMA, LR, BATCH, MEMORY, HIDDEN = 0.99, 5e-4, 64, 60_000, 256
 UPDATE_EVERY, TARGET_EVERY = 2, 500             # env steps between updates; updates between target-net copies
