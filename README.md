@@ -76,9 +76,45 @@ Every factor is **off unless you switch it on**. With no flags you get the plain
 | `--humans N` | N humans walk randomly in the aisles. Robots see them in their rays (type 6) and are blocked by them. |
 | `--max-steps N` | episode length |
 
-A **scenario** is a named preset of these flags, in `env/scenarios.py`: `basic`, `mixed`, `priority`, `humans`, `maze`,
-`hard`. Add yours as one line. A flag you type always wins over the scenario (`--scenario hard --humans 0`). In code,
-the same switches are keyword arguments: `Warehouse(layout, n_robots=4, mixed_crates=True, humans=2)`.
+A **scenario** is a named preset of these flags, in `env/scenarios.py`: `basic`, `mixed`, `priority`, `humans`,
+`maze`, `hard`, `big`. Add yours as one line. A flag you type always wins over the scenario
+(`--scenario hard --humans 0`). In code, the same switches are keyword arguments:
+`Warehouse(layout, n_robots=4, mixed_crates=True, humans=2)`.
+
+## Baselines: the numbers to beat
+
+`greedy` is the scripted rule in `rl/policies/greedy.py`. It runs a fresh BFS every step, so it is a strong
+navigator and a fair bar for a learned policy. **Lead with deliveries and invalid.** `mean_return` is a poor
+headline: it has a hard floor of `max_steps × -0.05` whatever the policy does.
+
+Measured with 20 episodes on seeds 90000-90019 (`hard` = 11x9 maze, 4 robots, 200 steps; `big` = 21x21,
+6 robots, 400 steps; every complexity factor on):
+
+| policy | scenario | maps | deliveries | blocked | invalid | mean_return |
+|---|---|---|---|---|---|---|
+| greedy | hard | one fixed maze | 5.60 ± 2.82 | 9.20 | 19.35 | -0.75 |
+| greedy | hard | **20 held-out mazes** | **5.00 ± 3.51** | 11.95 | 34.05 | -2.58 |
+| greedy | big | one fixed maze | 12.30 ± 4.11 | 20.15 | 26.60 | -10.20 |
+| greedy | big | **20 held-out mazes** | **10.65 ± 4.16** | 16.50 | 32.05 | -11.67 |
+| greedy | big | 100 held-out mazes | 10.61 ± 4.35 | 20.20 | 30.75 | -12.33 |
+
+```powershell
+# the bar a learned policy has to clear, on the same maps rl.run evaluates on
+python -m rl.bench greedy --scenarios hard big --episodes 20 --seed 90000 --new-map --out results/greedy_random
+# the same maps a single-maze measurement would have used, for comparison
+python -m rl.bench greedy --scenarios hard big --episodes 20 --seed 90000 --out results/greedy_fixed
+```
+
+Two things to know before quoting any of this:
+
+- **Randomising the maze costs greedy about 12%** (5.60 -> 5.00 on `hard`, 12.30 -> 10.65 on `big`). It was
+  assumed not to, on the reasoning that greedy re-plans on whatever map it is handed -- but one fixed maze is
+  one draw, and averaging over twenty includes the awkward ones. Per-episode spread also grows (blocked std
+  6.79 -> 11.39 on `hard`). So a learned policy must be compared against the randomised row, and never
+  against a fixed-map number.
+- **20 episodes is marginal for `big`.** The per-episode standard deviation is ~4.2 deliveries, so the
+  standard error over 20 episodes is ~0.93 and a difference under ~1.9 deliveries is not a result. Use 100
+  episodes (standard error ~0.44) for anything being reported.
 
 ## Writing an algorithm (guide for the algorithm team)
 

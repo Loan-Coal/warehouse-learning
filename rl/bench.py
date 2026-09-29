@@ -24,6 +24,9 @@ def main():
     parser.add_argument("--scenarios", nargs="+", default=["basic"], help=f"from: {', '.join(SCENARIOS)}")
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1000, help="evaluation seeds: seed + k (unlike training's 0 + k)")
+    parser.add_argument("--new-map", action="store_true",
+                        help="a new maze every episode (seed + k), the same maps rl.run evaluates\n"
+                             "on. Use --seed 90000 to land on the held-out ones")
     parser.add_argument("--out", default="results/bench", help="writes OUT.csv and OUT.png")
     args = parser.parse_args()
     unknown = [s for s in args.scenarios if s not in SCENARIOS]
@@ -34,7 +37,7 @@ def main():
     for entry in args.entries:
         for scenario in args.scenarios:
             try:
-                rows += evaluate(entry, scenario, args.episodes, args.seed)
+                rows += evaluate(entry, scenario, args.episodes, args.seed, args.new_map)
             except ValueError as err:
                 print(f"skipped {entry} on {scenario}: {err}")
     if not rows:
@@ -56,10 +59,12 @@ def main():
     print(f"wrote {out.with_suffix('.png')}")
 
 
-def evaluate(entry, scenario, episodes, seed):
+def evaluate(entry, scenario, episodes, seed, new_map=False):
     """Per-episode result rows for one algorithm on one scenario."""
     name, _, checkpoint = entry.partition("=")
     argv = ["--scenario", scenario, "--seed", str(seed)]
+    if new_map:
+        argv += ["--new-map"]
     if name:
         argv += ["--policy", name]
     if checkpoint:
