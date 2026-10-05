@@ -32,7 +32,13 @@ sys.argv = sys.argv[:1]
 
 from isaacsim import SimulationApp  # noqa: E402
 
-app = SimulationApp({"headless": ARGS.headless})
+app = SimulationApp({
+    "headless": ARGS.headless,
+    "settings": {   # Isaac Sim 6.x: switch off the deprecated rtx sensor extension
+        "/app/exts/fold/isaacsim.sensors.rtx": False,
+        "/exts/isaacsim.sensors.rtx/enabled": False,
+    },
+})
 
 from rl.loop import run_episode  # noqa: E402
 from rl.cli import build_or_exit  # noqa: E402
