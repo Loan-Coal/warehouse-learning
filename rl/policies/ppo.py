@@ -1,12 +1,15 @@
-"""Masked PPO: one set of weights for every robot, each input carrying a summary of the fleet.
+"""Centralised masked PPO: ONE agent that sees the whole fleet and picks every robot's action.
 
-IPPO/MAPPO in shape -- every robot scored by the same network from its own features plus the
-fleet mean, trained on its OWN advantage. Why on-policy, why the shaping is not the textbook
-form, and why there are no schedules: LEARNINGS.md. In short, robots sharing weights make a
-replay buffer hold transitions whose dynamics no longer exist, and a stochastic policy is the
-fix for the deadlock sharing causes -- which is why evaluation samples rather than argmaxes.
+One network reads every robot's feature row at once (the list of all robots' observations, never
+env.get_state()). For robot i a pairwise encoder asks, of each other robot j, a small learned
+question about the pair (row_i, row_j) and keeps the strongest answer (max) and the typical one
+(mean); a head turns [row_i, those answers] into 6 logits. The six actions are then sampled
+independently, in parallel, and each robot is trained on its OWN advantage. Why on-policy, why the
+shaping is not the textbook form, and why there are no schedules: LEARNINGS.md.
 
-Ablations: --policy-opt bfs=0, shaping=0, eval_greedy=1.
+Ablations: --policy-opt central=0 (the pool holds only robots i's own rays hit, so a robot
+outside every ray is invisible, as in a decentralised policy), bfs=0, shaping=0, eval_greedy=1.
+The earlier mean-pool PPO (own row + fleet mean) is git tag ppo-mean.
 """
 import json
 import random
@@ -15,6 +18,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from env.observation import HEADINGS, ROBOT
 from env.warehouse import N_ACTIONS
 from rl.features import Features, target_changed
 from rl.nav import legal_actions
@@ -24,7 +28,7 @@ GAMMA, LAMBDA = 0.99, 0.95
 ROLLOUT = 128                   # env steps per env before an update
 EPOCHS, MINIBATCHES = 4, 4
 CLIP, VF_COEF, GRAD_CLIP = 0.2, 0.25, 0.5       # VF_COEF is the whole weight: 0.5 * 0.5 of the usual form
-LR, ENT_COEF, HIDDEN = 3e-4, 0.01, 256
+LR, ENT_COEF, HIDDEN, PAIR = 3e-4, 0.01, 256, 128     # PAIR: width of the pairwise encoder
 
 # A constant, not a running normaliser: nothing to keep in a checkpoint (LEARNINGS.md).
 REWARD_SCALE, SHAPE = 0.1, 0.3
@@ -49,13 +53,72 @@ def mlp(n_in, n_out, out_gain):
     return net
 
 
-def pooled(x):
-    """[..., robots, width] -> [..., robots, 2 * width]: own features beside the fleet mean.
+class PairNet(nn.Module):
+    """[..., robots, width] -> [..., robots, width + 2 * PAIR]: each robot's row beside what the
+    others mean to it.
 
-    A mean, not a concatenation, so the width is independent of the robot count and the result of
-    their order -- which is what lets a 4-robot checkpoint play 6.
+    phi reads the pair [row_i, row_j] together, so its first layer can form the difference
+    (where is j relative to me?) that no function of a fleet MEAN can. The answers are pooled over
+    j by max ("is ANY robot threatening me?") and by mean ("how crowded is it?"). Pooling makes the
+    result independent of the order and the number of robots, so a 4-robot checkpoint plays 6.
+
+    `allow[..., i, j]` says whether robot i may know about robot j; a row with no allowed j (a
+    lone robot, or central=0 with nobody in its rays) pools to zeros.
     """
-    return torch.cat([x, x.mean(-2, keepdim=True).expand_as(x)], -1)
+
+    def __init__(self, width):
+        super().__init__()
+        self.phi = nn.Sequential(nn.Linear(2 * width, PAIR), nn.ReLU(),
+                                 nn.Linear(PAIR, PAIR), nn.ReLU())
+        for layer in self.phi:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, 2 ** 0.5)
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, x, allow):
+        n = x.shape[-2]
+        mine = x.unsqueeze(-2).expand(*x.shape[:-1], n, x.shape[-1])        # [.., i, j, w] = row_i
+        theirs = x.unsqueeze(-3).expand_as(mine)                           # [.., i, j, w] = row_j
+        keep = allow.unsqueeze(-1).to(x.dtype)
+        answers = self.phi(torch.cat([mine, theirs], -1)) * keep           # ReLU >= 0: masked -> 0
+        mean = answers.sum(-2) / keep.sum(-2).clamp(min=1)
+        return torch.cat([x, answers.amax(-2), mean], -1)
+
+
+class Net(nn.Module):
+    """Pairwise encoder followed by a two-hidden-layer head. One for the actor, one for the critic."""
+
+    def __init__(self, width, n_out, out_gain):
+        super().__init__()
+        self.pair = PairNet(width)
+        self.head = mlp(width + 2 * PAIR, n_out, out_gain)
+
+    def forward(self, x, allow):
+        return self.head(self.pair(x, allow))
+
+
+def visible(obs, central):
+    """[envs, robots, robots] bool: may robot i know about robot j?
+
+    central=True: every other robot -- the central agent holds all the observations. central=False:
+    only a robot one of i's own rays hit, which is what a decentralised robot could know.
+    """
+    n = len(obs[0])
+    if central:
+        return (~torch.eye(n, dtype=torch.bool)).expand(len(obs), n, n)
+    out = torch.zeros(len(obs), n, n, dtype=torch.bool)
+    for e, fleet in enumerate(obs):
+        where = {(o.x, o.y): j for j, o in enumerate(fleet)}
+        for i, o in enumerate(fleet):
+            rays = ((o.front_d, o.front_t), (o.right_d, o.right_t),
+                    (o.back_d, o.back_t), (o.left_d, o.left_t))
+            for k, (dist, kind) in enumerate(rays):
+                if kind == ROBOT:
+                    dx, dy = HEADINGS[(o.heading + k) % 4]
+                    j = where.get((o.x + dx * dist, o.y + dy * dist))
+                    if j is not None and j != i:
+                        out[e, i, j] = True
+    return out
 
 
 def masked_mean(values, live):
@@ -74,6 +137,7 @@ class Step(NamedTuple):
     reward: torch.Tensor    # what the net learns from (scaled, shaped)
     done: torch.Tensor      # the time limit was hit
     ready: torch.Tensor     # the env actually carried the action out
+    allow: torch.Tensor     # [robots, robots]: which robots each robot's encoder may look at
 
 
 class PPO(Policy):
@@ -82,7 +146,7 @@ class PPO(Policy):
     def __init__(self, spec, seed=0):
         super().__init__(spec, seed)
         self.rng = random.Random(seed)
-        self.use_shaping, self.eval_greedy = True, False
+        self.use_shaping, self.eval_greedy, self.central = True, False, True
         self.lr, self.ent = LR, ENT_COEF
         self.typed = set()      # settings given to configure(), which a checkpoint must not undo
         self.inputs = Features(spec.obs_features)
@@ -94,19 +158,23 @@ class PPO(Policy):
 
     # ------------------------------------------------------------------ setup
 
-    def configure(self, bfs=None, shaping=None, eval_greedy=None, lr=None, ent=None, **unknown):
+    def configure(self, bfs=None, shaping=None, eval_greedy=None, lr=None, ent=None, central=None,
+                  **unknown):
         if unknown:
             raise ValueError(f"unknown setting {', '.join(sorted(unknown))}; this policy takes "
-                             f"bfs, shaping, eval_greedy, lr, ent")
+                             f"bfs, shaping, eval_greedy, lr, ent, central")
         # rl/cli.py configures before it loads a checkpoint; load() leaves these alone.
         self.typed |= {key for key, value in (("shaping", shaping), ("eval_greedy", eval_greedy),
-                                              ("lr", lr), ("ent", ent)) if value is not None}
+                                              ("lr", lr), ("ent", ent), ("central", central))
+                       if value is not None}
         if shaping is not None:
             self.use_shaping = flag(shaping, "shaping")
         if eval_greedy is not None:
             self.eval_greedy = flag(eval_greedy, "eval_greedy")
         if ent is not None:
             self.ent = _number(ent, "ent")
+        if central is not None:
+            self.central = flag(central, "central")
         rebuild = False
         if lr is not None and _number(lr, "lr") != self.lr:
             self.lr, rebuild = _number(lr, "lr"), True
@@ -119,9 +187,9 @@ class PPO(Policy):
 
     def _build(self):
         torch.manual_seed(self.seed)
-        width = 2 * self.inputs.width
-        self.actor = mlp(width, N_ACTIONS, 0.01)
-        self.critic = mlp(width, 1, 1.0)
+        width = self.inputs.width
+        self.actor = Net(width, N_ACTIONS, 0.01)
+        self.critic = Net(width, 1, 1.0)
         self.opt = torch.optim.Adam([*self.actor.parameters(), *self.critic.parameters()],
                                     lr=self.lr)
 
@@ -136,22 +204,26 @@ class PPO(Policy):
     def act_vec(self, obs):
         """Every robot of every env through one forward pass.
 
-        pooled() averages over the robot axis, so envs never mix: correct, not merely faster.
+        The encoder pools over the robot axis only, so envs never mix: correct, not merely faster.
         Evaluation samples rather than argmaxing -- see the deadlock argument in LEARNINGS.md.
         """
         x = self.inputs.batch(obs)
         mask = self.masks(obs)
+        allow = self.reach(obs)
         with torch.no_grad():
-            wide = pooled(x)
-            logits = self.actor(wide).masked_fill(~mask, NEG)
-            value = self.critic(wide).squeeze(-1)
+            logits = self.actor(x, allow).masked_fill(~mask, NEG)
+            value = self.critic(x, allow).squeeze(-1)
             if self.training or not self.eval_greedy:
                 actions = torch.distributions.Categorical(logits=logits).sample()
             else:
                 actions = logits.argmax(-1)
             logp = torch.log_softmax(logits, -1).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-        self.acting = (x, mask, actions, logp, value)
+        self.acting = (x, mask, actions, logp, value, allow)
         return actions.tolist()
+
+    def reach(self, obs, central=None):
+        """[envs, robots, robots] bool: which robots each robot's encoder may look at."""
+        return visible(obs, self.central if central is None else central)
 
     def masks(self, obs):
         """[envs, robots, N_ACTIONS] of bools: which actions the env would actually carry out."""
@@ -164,7 +236,7 @@ class PPO(Policy):
         self.update_vec([obs], [actions], [rewards], [next_obs], [done])
 
     def update_vec(self, obs, actions, rewards, next_obs, dones):
-        x, mask, acted, logp, value = self.acting
+        x, mask, acted, logp, value, allow = self.acting
         if x.shape[0] != len(obs):
             raise RuntimeError(f"update_vec got {len(obs)} envs but act_vec ran on {x.shape[0]}")
         # V(next_obs) is only computed here where act_vec will not score it next: at an episode
@@ -175,13 +247,13 @@ class PPO(Policy):
         after = torch.zeros_like(value)
         if rows:
             with torch.no_grad():
-                after[rows] = self.critic(pooled(self.inputs.batch(
-                    [next_obs[i] for i in rows]))).squeeze(-1)
+                ended = [next_obs[i] for i in rows]
+                after[rows] = self.critic(self.inputs.batch(ended), self.reach(ended)).squeeze(-1)
         self.rollout.append(Step(
             x, mask, acted, logp, value, after,
             torch.tensor([self.learning_rewards(*step) for step in zip(obs, rewards, next_obs)]),
             torch.tensor([float(d) for d in dones]),
-            torch.tensor([[float(o.ready) for o in one] for one in obs])))
+            torch.tensor([[float(o.ready) for o in one] for one in obs]), allow))
         self.steps += len(obs)
         if len(self.rollout) >= ROLLOUT:
             self._learn()
@@ -202,7 +274,7 @@ class PPO(Policy):
         return out
 
     def _learn(self):
-        x, mask, acted, logp, value, after, reward, done, ready = (
+        x, mask, acted, logp, value, after, reward, done, ready, allow = (
             torch.stack(part) for part in zip(*self.rollout))
         # Fill in the bootstraps update_vec skipped: where an env did not end, it is t+1's value.
         carried = done[:-1].unsqueeze(-1).bool()
@@ -210,9 +282,9 @@ class PPO(Policy):
         advantage = self._gae(reward, value, after, done)
         returns = advantage + value
 
-        # Keep the robot axis: pooled() averages over one env's robots, so a minibatch is a
+        # Keep the robot axis: the encoder pools over one env's robots, so a minibatch is a
         # set of whole fleets, never of loose robots.
-        flat = [t.flatten(0, 1) for t in (x, mask, acted, logp, advantage, returns, ready)]
+        flat = [t.flatten(0, 1) for t in (x, mask, acted, logp, advantage, returns, ready, allow)]
         groups = flat[0].shape[0]
         order = list(range(groups))
         size = max(1, groups // MINIBATCHES)
@@ -242,9 +314,8 @@ class PPO(Policy):
         return advantage
 
     def _step(self, batch):
-        x, mask, acted, old_logp, advantage, returns, live = batch
-        inputs = pooled(x)
-        logits = self.actor(inputs).masked_fill(~mask, NEG)
+        x, mask, acted, old_logp, advantage, returns, live, allow = batch
+        logits = self.actor(x, allow).masked_fill(~mask, NEG)
         dist = torch.distributions.Categorical(logits=logits)
         ratio = (dist.log_prob(acted) - old_logp).exp()
 
@@ -261,7 +332,7 @@ class PPO(Policy):
         # The value loss keeps every row, including the discarded ones: time still passed and a
         # reward still arrived, so the critic should predict that return. Only the POLICY has
         # nothing to learn from an action the env threw away.
-        value_loss = ((self.critic(inputs).squeeze(-1) - returns) ** 2).mean()
+        value_loss = ((self.critic(x, allow).squeeze(-1) - returns) ** 2).mean()
         loss = policy_loss + VF_COEF * value_loss - self.ent * entropy
         self.opt.zero_grad()
         loss.backward()
@@ -287,6 +358,7 @@ class PPO(Policy):
         torch.save(self.opt.state_dict(), folder / "opt.pt")
         state = {"bfs": self.inputs.use_bfs, "shaping": self.use_shaping,
                  "eval_greedy": self.eval_greedy, "lr": self.lr, "ent": self.ent,
+                 "central": self.central, "encoder": "pair",
                  "steps": self.steps, "updates": self.updates, **self.log}
         (folder / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -297,7 +369,11 @@ class PPO(Policy):
         evaluate with argmax), except bfs: the checkpoint's decides how wide the weights are.
         """
         state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
-        saved = {"shaping": "use_shaping", "eval_greedy": "eval_greedy", "lr": "lr", "ent": "ent"}
+        if state.get("encoder") != "pair":
+            raise ValueError("this checkpoint was trained by the mean-pool PPO, whose weights do not "
+                             "fit the pairwise encoder: retrain, or check out git tag ppo-mean to play it")
+        saved = {"shaping": "use_shaping", "eval_greedy": "eval_greedy", "lr": "lr", "ent": "ent",
+                 "central": "central"}
         for key, attribute in saved.items():
             if key not in self.typed:
                 setattr(self, attribute, state[key])

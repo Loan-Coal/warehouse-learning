@@ -1,4 +1,4 @@
-"""rl/policies/ppo.py: the mask, the truncation bootstrap, and one real update.
+"""rl/policies/ppo.py: the centralised encoder, the mask, the truncation bootstrap, one real update.
 
 Two of these cover mistakes that produce no error and no obviously wrong number, and so would
 otherwise only show up as "PPO does not work on this problem":
@@ -23,8 +23,9 @@ import torch
 
 import rl.policies.ppo as mod
 from env.layout import maze_layout
+from env.observation import HEADINGS, RIGHT, ROBOT, obs_type
 from env.warehouse import N_ACTIONS, Warehouse
-from rl.policies.ppo import PPO, pooled
+from rl.policies.ppo import PPO, visible
 from rl.vecenv import VecWarehouse
 
 ROBOTS, STEPS = 4, 40
@@ -59,6 +60,95 @@ def play(policy, vec, steps, train=True):
             policy.reset()
 
 
+def fleet(*robots):
+    """Blind observations (no rays hit anything, no task) for robots given as (x, y, heading)."""
+    fields = obs_type(PPO.OBS)._fields
+    blank = obs_type(PPO.OBS)(*[0] * len(fields))
+    return [blank._replace(x=x, y=y, heading=h, target_x=x, target_y=y, period=1, ready=1)
+            for x, y, h in robots]
+
+
+def ahead(o, k, d, kind=ROBOT):
+    """The same observation with ray k (0 front, 1 right, 2 back, 3 left) hitting `kind` at d."""
+    side = ("front", "right", "back", "left")[k]
+    return o._replace(**{f"{side}_d": d, f"{side}_t": kind})
+
+
+class TestVisible(unittest.TestCase):
+    """Who each robot may know about. central=False is the ablation: only what its own rays hit."""
+
+    def setUp(self):
+        a, b, c = fleet((2, 2, RIGHT), (5, 2, RIGHT), (3, 3, RIGHT))
+        self.obs = [[ahead(a, 0, 3), b, c]]          # a's front ray hits b, three cells east
+
+    def test_a_ray_hit_is_visible_and_a_diagonal_robot_is_not(self):
+        got = visible(self.obs, central=False)[0]
+        self.assertEqual(got.tolist(), [[False, True, False], [False] * 3, [False] * 3])
+
+    def test_central_sees_every_other_robot_and_never_itself(self):
+        got = visible(self.obs, central=True)[0]
+        self.assertEqual(got.tolist(), [[False, True, True], [True, False, True], [True, True, False]])
+
+    def test_a_ray_uses_the_robots_heading(self):
+        dx, dy = HEADINGS[(RIGHT + 1) % 4]           # right of a robot facing east is south
+        a, b = fleet((2, 2, RIGHT), (2 + 2 * dx, 2 + 2 * dy, RIGHT))
+        self.assertTrue(visible([[ahead(a, 1, 2), b]], central=False)[0, 0, 1])
+
+    def test_a_human_in_a_ray_is_not_a_robot(self):
+        a, b = fleet((2, 2, RIGHT), (5, 2, RIGHT))
+        self.assertFalse(visible([[ahead(a, 0, 3, kind=ROBOT + 1), b]], central=False).any())
+
+
+class TestCentralised(unittest.TestCase):
+    def setUp(self):
+        self.policy = PPO(maze_env().spec, seed=0)
+        self.policy.reset()
+
+    def run_net(self, obs, central):
+        x = self.policy.inputs.batch([obs])
+        with torch.no_grad():
+            return self.policy.actor(x, self.policy.reach([obs], central))
+
+    def test_a_robot_outside_every_ray_changes_the_decision_only_when_central(self):
+        near = fleet((2, 2, RIGHT), (5, 2, RIGHT), (3, 3, RIGHT))
+        far = [near[0], near[1], near[2]._replace(x=1, y=3, target_x=1, target_y=3)]
+        for central, expect_change in ((True, True), (False, False)):
+            with self.subTest(central=central):
+                same = torch.equal(self.run_net(near, central)[0, 0], self.run_net(far, central)[0, 0])
+                self.assertEqual(not same, expect_change)
+
+    def test_permuting_the_robots_permutes_the_answers(self):
+        obs = fleet((2, 2, 0), (5, 2, 1), (3, 3, 2), (1, 1, 3))
+        order = [2, 0, 3, 1]
+        with torch.no_grad():
+            x = self.policy.inputs.batch([obs])
+            allow = self.policy.reach([obs], True)
+            base = self.policy.actor(x, allow)
+            moved = self.policy.actor(x[:, order], allow[:, order][:, :, order])
+            value = self.policy.critic(x, allow)
+            value_moved = self.policy.critic(x[:, order], allow[:, order][:, :, order])
+        torch.testing.assert_close(moved, base[:, order])
+        torch.testing.assert_close(value_moved, value[:, order])
+
+    def test_a_lone_robot_gets_finite_logits_and_value(self):
+        obs = fleet((2, 2, RIGHT))
+        x = self.policy.inputs.batch([obs])
+        allow = self.policy.reach([obs], True)
+        self.assertEqual(tuple(allow.shape), (1, 1, 1))
+        with torch.no_grad():
+            self.assertTrue(torch.isfinite(self.policy.actor(x, allow)).all())
+            self.assertTrue(torch.isfinite(self.policy.critic(x, allow)).all())
+
+    def test_envs_never_mix(self):
+        first, second = fleet((2, 2, 0), (5, 2, 1)), fleet((1, 1, 3), (3, 3, 2))
+        with torch.no_grad():
+            both = self.policy.actor(self.policy.inputs.batch([first, second]),
+                                     self.policy.reach([first, second], True))
+            alone = self.policy.actor(self.policy.inputs.batch([first]),
+                                      self.policy.reach([first], True))
+        torch.testing.assert_close(both[:1], alone)
+
+
 class TestMask(unittest.TestCase):
     def test_it_never_plays_an_action_the_env_would_refuse(self):
         for train in (True, False):
@@ -88,7 +178,7 @@ class TestMask(unittest.TestCase):
         policy.reset()
         mask = policy.masks([obs])
         with torch.no_grad():
-            logits = policy.actor(pooled(policy.inputs.batch([obs]))).masked_fill(~mask, mod.NEG)
+            logits = policy.actor(policy.inputs.batch([obs]), policy.reach([obs])).masked_fill(~mask, mod.NEG)
             dist = torch.distributions.Categorical(logits=logits)
         self.assertTrue(torch.all(dist.probs[~mask] == 0.0), "an illegal action kept probability")
         self.assertTrue(torch.isfinite(dist.entropy()).all())
@@ -134,7 +224,7 @@ class TestTruncationBootstrap(unittest.TestCase):
 
         def recording(obs, actions, rewards, next_obs, dones):
             with torch.no_grad():
-                expected.append(policy.critic(pooled(policy.inputs.batch(next_obs))).squeeze(-1))
+                expected.append(policy.critic(policy.inputs.batch(next_obs), policy.reach(next_obs)).squeeze(-1))
             update_vec(obs, actions, rewards, next_obs, dones)
 
         def spy(reward, value, after, done):
@@ -179,7 +269,8 @@ class TestUpdate(unittest.TestCase):
         for row in range(ROBOTS):
             acted[0, row] = next(a for a in range(N_ACTIONS) if mask[0, row, a])
         args = [x, mask, acted, torch.zeros(1, ROBOTS), torch.ones(1, ROBOTS),
-                torch.full((1, ROBOTS), 3.0), torch.zeros(1, ROBOTS)]     # ready all zero
+                torch.full((1, ROBOTS), 3.0), torch.zeros(1, ROBOTS),     # ready all zero
+                policy.reach([obs])]
         policy._step([t.clone() for t in args])
         self.assertTrue(math.isfinite(policy.log["loss"]))
         # With no live row the policy term and the entropy are both zero by masked_mean, so the
@@ -223,10 +314,11 @@ class TestStoredAndRecomputed(unittest.TestCase):
         play(policy, vec, STEPS + 5)                    # spans an episode boundary and a map change
         self.assertGreater(len(policy.rollout), STEPS)
 
-        x, mask, acted, logp = [torch.stack(p) for p in list(zip(*policy.rollout))[:4]]
+        x, mask, acted, logp, allow = [torch.stack([getattr(s, f) for s in policy.rollout])
+                                       for f in ("x", "mask", "acted", "logp", "allow")]
         with torch.no_grad():
-            logits = policy.actor(pooled(x.flatten(0, 1))).masked_fill(~mask.flatten(0, 1),
-                                                                      mod.NEG)
+            logits = policy.actor(x.flatten(0, 1), allow.flatten(0, 1)).masked_fill(
+                ~mask.flatten(0, 1), mod.NEG)
             again = torch.distributions.Categorical(logits=logits).log_prob(acted.flatten(0, 1))
         ratio = (again - logp.flatten(0, 1)).exp()
         self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-5),
@@ -304,6 +396,36 @@ class TestTransfer(unittest.TestCase):
             wide.load(folder)
             self.assertEqual((wide.inputs.width, wide.inputs.use_bfs),
                              (narrow.inputs.width, False))
+
+
+class TestEncoderCheckpoint(unittest.TestCase):
+    def test_a_checkpoint_from_the_mean_pool_ppo_is_refused_by_name(self):
+        env = maze_env()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            PPO(env.spec, seed=0).save(folder)
+            state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+            state.pop("encoder")
+            (folder / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "ppo-mean"):
+                PPO(env.spec, seed=0).load(folder)
+
+    def test_central_is_saved_and_a_typed_value_beats_it(self):
+        env = maze_env()
+        trained = PPO(env.spec, seed=0)
+        trained.configure(central="0")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            trained.save(folder)
+            loaded = PPO(env.spec, seed=0)
+            loaded.load(folder)
+            self.assertFalse(loaded.central)
+            typed = PPO(env.spec, seed=0)
+            typed.configure(central="1")
+            typed.load(folder)
+            self.assertTrue(typed.central)
+        with self.assertRaisesRegex(ValueError, "central wants 0 or 1"):
+            trained.configure(central="maybe")
 
 
 class TestSettingsAcrossALoad(unittest.TestCase):

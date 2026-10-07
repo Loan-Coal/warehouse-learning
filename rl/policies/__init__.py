@@ -10,6 +10,6 @@ from rl.policy import independent, shared  # noqa: F401  (independent: for your 
 
 POLICIES = {
     "greedy": shared(GreedyRule),
-    "ppo": PPO,                             # one network for every robot, each seeing the fleet
+    "ppo": PPO,                             # centralised: one agent, a pairwise encoder over the whole fleet
     "template": shared(TemplateQLearner),   # the template as-is: try the whole pipeline before writing code
 }

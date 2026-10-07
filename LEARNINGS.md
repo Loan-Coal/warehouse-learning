@@ -160,3 +160,19 @@ Most of these cost a training run to find out. The code points here instead of r
   (`b0_*`, `ent0*_*`) are refused, and the comparison runs that follow are all on v2.
 - `--policy-opt` given with `--checkpoint` used to be silently overwritten by the checkpoint's
   saved settings (PPO.load ran after configure). Fixed; typed settings now win, except `bfs`.
+
+## Centralised PPO (pairwise encoder)
+
+- `rl/policies/ppo.py` is now ONE agent that reads every robot's row at once. The old
+  own-row-plus-fleet-mean PPO is git tag `ppo-mean`; its checkpoints are refused by name.
+- **Why the mean had to go.** A mean of everyone's absolute coordinates cannot say "a robot is
+  about to enter my next cell"; that is a relation between two rows, not a property of the average.
+  `phi([row_i, row_j])` sees both rows, so its first layer can subtract them. Max-pooling keeps
+  "is ANY robot a threat"; the mean keeps "how crowded".
+- **Decisions stay independent.** Six actions are sampled in parallel from six distributions that
+  all depend on the whole fleet but not on each other's draw, so mirror standoffs are still broken
+  by sampling. Autoregressive heads (robot k sees robots 1..k-1's actions) are a separate experiment.
+- **`--policy-opt central=0` is the ablation.** The pool then holds only robots one of i's own
+  rays hit. If it scores the same as the default, the gain came from the pairwise encoder, not
+  from seeing past the rays.
+- Cost: ~2x slower per env step than the mean-pool (1042 vs 2002 steps/s, `big`, 16 envs, alone).
