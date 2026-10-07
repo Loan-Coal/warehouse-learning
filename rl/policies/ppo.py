@@ -10,6 +10,7 @@ Ablations: --policy-opt bfs=0, shaping=0, eval_greedy=1.
 """
 import json
 import random
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -22,7 +23,7 @@ from rl.policy import Policy, flag
 GAMMA, LAMBDA = 0.99, 0.95
 ROLLOUT = 128                   # env steps per env before an update
 EPOCHS, MINIBATCHES = 4, 4
-CLIP, VF_COEF, GRAD_CLIP = 0.2, 0.5, 0.5
+CLIP, VF_COEF, GRAD_CLIP = 0.2, 0.25, 0.5       # VF_COEF is the whole weight: 0.5 * 0.5 of the usual form
 LR, ENT_COEF, HIDDEN = 3e-4, 0.01, 256
 
 # A constant, not a running normaliser: nothing to keep in a checkpoint (LEARNINGS.md).
@@ -62,6 +63,19 @@ def masked_mean(values, live):
     return (values * live).sum() / live.sum().clamp(min=1)
 
 
+class Step(NamedTuple):
+    """One vectorised step of a rollout; every field is a tensor with a leading [envs] axis."""
+    x: torch.Tensor         # features of every robot
+    mask: torch.Tensor      # which actions were legal
+    acted: torch.Tensor
+    logp: torch.Tensor      # of the action taken, when it was taken
+    value: torch.Tensor
+    after: torch.Tensor     # V(next obs), only filled where act_vec will not score it next
+    reward: torch.Tensor    # what the net learns from (scaled, shaped)
+    done: torch.Tensor      # the time limit was hit
+    ready: torch.Tensor     # the env actually carried the action out
+
+
 class PPO(Policy):
     OBS = Features.OBS
 
@@ -70,6 +84,7 @@ class PPO(Policy):
         self.rng = random.Random(seed)
         self.use_shaping, self.eval_greedy = True, False
         self.lr, self.ent = LR, ENT_COEF
+        self.typed = set()      # settings given to configure(), which a checkpoint must not undo
         self.inputs = Features(spec.obs_features)
         self.inputs.use(spec.grid)
         self.steps, self.updates = 0, 0
@@ -83,6 +98,9 @@ class PPO(Policy):
         if unknown:
             raise ValueError(f"unknown setting {', '.join(sorted(unknown))}; this policy takes "
                              f"bfs, shaping, eval_greedy, lr, ent")
+        # rl/cli.py configures before it loads a checkpoint; load() leaves these alone.
+        self.typed |= {key for key, value in (("shaping", shaping), ("eval_greedy", eval_greedy),
+                                              ("lr", lr), ("ent", ent)) if value is not None}
         if shaping is not None:
             self.use_shaping = flag(shaping, "shaping")
         if eval_greedy is not None:
@@ -149,11 +167,17 @@ class PPO(Policy):
         x, mask, acted, logp, value = self.acting
         if x.shape[0] != len(obs):
             raise RuntimeError(f"update_vec got {len(obs)} envs but act_vec ran on {x.shape[0]}")
-        with torch.no_grad():
-            # At a boundary next_obs is the state the episode ENDED on, and the env only runs out
-            # of time, so this value is a real estimate of what came next. Never zeroed.
-            after = self.critic(pooled(self.inputs.batch(next_obs))).squeeze(-1)
-        self.rollout.append((
+        # V(next_obs) is only computed here where act_vec will not score it next: at an episode
+        # boundary (next_obs is the state it ENDED on, never zeroed) and at the last step of a
+        # rollout. Elsewhere _learn reuses the next step's value (LEARNINGS.md: Performance).
+        last = len(self.rollout) + 1 >= ROLLOUT
+        rows = list(range(len(obs))) if last else [i for i, d in enumerate(dones) if d]
+        after = torch.zeros_like(value)
+        if rows:
+            with torch.no_grad():
+                after[rows] = self.critic(pooled(self.inputs.batch(
+                    [next_obs[i] for i in rows]))).squeeze(-1)
+        self.rollout.append(Step(
             x, mask, acted, logp, value, after,
             torch.tensor([self.learning_rewards(*step) for step in zip(obs, rewards, next_obs)]),
             torch.tensor([float(d) for d in dones]),
@@ -180,6 +204,9 @@ class PPO(Policy):
     def _learn(self):
         x, mask, acted, logp, value, after, reward, done, ready = (
             torch.stack(part) for part in zip(*self.rollout))
+        # Fill in the bootstraps update_vec skipped: where an env did not end, it is t+1's value.
+        carried = done[:-1].unsqueeze(-1).bool()
+        after = torch.cat([torch.where(carried, after[:-1], value[1:]), after[-1:]])
         advantage = self._gae(reward, value, after, done)
         returns = advantage + value
 
@@ -234,7 +261,7 @@ class PPO(Policy):
         # The value loss keeps every row, including the discarded ones: time still passed and a
         # reward still arrived, so the critic should predict that return. Only the POLICY has
         # nothing to learn from an action the env threw away.
-        value_loss = 0.5 * ((self.critic(inputs).squeeze(-1) - returns) ** 2).mean()
+        value_loss = ((self.critic(inputs).squeeze(-1) - returns) ** 2).mean()
         loss = policy_loss + VF_COEF * value_loss - self.ent * entropy
         self.opt.zero_grad()
         loss.backward()
@@ -264,9 +291,16 @@ class PPO(Policy):
         (folder / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     def load(self, folder):
+        """The weights, the optimiser and every setting configure() was not given.
+
+        A typed setting wins over the saved one (--checkpoint X --policy-opt eval_greedy=1 must
+        evaluate with argmax), except bfs: the checkpoint's decides how wide the weights are.
+        """
         state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
-        self.use_shaping = state["shaping"]
-        self.eval_greedy, self.lr, self.ent = state["eval_greedy"], state["lr"], state["ent"]
+        saved = {"shaping": "use_shaping", "eval_greedy": "eval_greedy", "lr": "lr", "ent": "ent"}
+        for key, attribute in saved.items():
+            if key not in self.typed:
+                setattr(self, attribute, state[key])
         if state["bfs"] != self.inputs.use_bfs:
             # The checkpoint's own setting wins: it decides how wide the saved weights are.
             self.inputs = Features(self.spec.obs_features, use_bfs=state["bfs"])
@@ -275,6 +309,8 @@ class PPO(Policy):
         self.actor.load_state_dict(torch.load(folder / "actor.pt", weights_only=True))
         self.critic.load_state_dict(torch.load(folder / "critic.pt", weights_only=True))
         self.opt.load_state_dict(torch.load(folder / "opt.pt", weights_only=True))
+        for group in self.opt.param_groups:
+            group["lr"] = self.lr       # the saved optimiser state brings its own lr back with it
         self.steps, self.updates = state["steps"], state["updates"]
         self.log = {key: state[key] for key in self.log}
 

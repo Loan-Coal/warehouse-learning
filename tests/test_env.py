@@ -9,8 +9,8 @@ import unittest
 from env.layout import DEFAULT_MAP, cells_of, maze_layout, parse, problems, random_layout
 from env.observation import FEATURES, obs_type
 from env.warehouse import (BACKWARD, CONTRACT_VERSION, DOCK_HIT, DOWN, DROPOFF, FORWARD, HUMAN, LEFT,
-                           PICKUP, R_DELIVERY, RIGHT, ROBOT, ROBOT_TYPES, TURN_LEFT, TURN_RIGHT, UP,
-                           VALUE_FLOOR, WALL, Task, Warehouse)
+                           N_ACTIONS, PICKUP, R_DELIVERY, R_STEP, RIGHT, ROBOT, ROBOT_TYPES, TURN_LEFT,
+                           TURN_RIGHT, UP, VALUE_FLOOR, WALL, Task, Warehouse)
 
 # Open rows on top so robots can be lined up freely; the bottom row makes the map valid.
 OPEN_MAP = """
@@ -63,6 +63,10 @@ class TestMovement(unittest.TestCase):
             headings.append(env.robots[0].heading)
             self.assertEqual((env.robots[0].pos, info["invalid"]), ((0, 0), 0))
         self.assertEqual(headings, [RIGHT, DOWN, RIGHT, UP, LEFT])
+
+    def test_there_is_no_wait_action(self):
+        # Contract v2: six actions. Standing still means turning in place (decided 2026-10-07).
+        self.assertEqual(N_ACTIONS, 6)
 
     def test_moves_into_obstacles_are_invalid(self):
         for pos, heading, action in [((0, 0), UP, FORWARD), ((0, 0), RIGHT, BACKWARD),
@@ -181,7 +185,7 @@ class TestTasks(unittest.TestCase):
             env.reset(seed)
             rng = random.Random(seed)
             for _ in range(100):
-                env.step([rng.randrange(6) for _ in range(3)])
+                env.step([rng.randrange(N_ACTIONS) for _ in range(3)])
                 tasks = [r.task for r in env.robots if r.task] + list(env.queue)
                 shelves = [t.pickup if t.kind == "retrieve" else t.dropoff for t in tasks]
                 self.assertEqual(len(shelves), len(set(shelves)))
@@ -335,7 +339,7 @@ class TestEpisodeAndApi(unittest.TestCase):
             obs = [env.reset(42)]
             rng = random.Random(1)
             for _ in range(100):
-                obs.append(env.step([rng.randrange(6), rng.randrange(6)]))
+                obs.append(env.step([rng.randrange(N_ACTIONS), rng.randrange(N_ACTIONS)]))
             return obs, env.get_state()
         self.assertEqual(rollout(), rollout())
 
@@ -352,7 +356,7 @@ class TestEpisodeAndApi(unittest.TestCase):
     def test_bad_actions_are_rejected(self):
         env = Warehouse(DEFAULT_MAP)
         env.reset(0)
-        for bad in ([TURN_RIGHT], [TURN_RIGHT, 6], [2.0, TURN_RIGHT]):
+        for bad in ([TURN_RIGHT], [TURN_RIGHT, N_ACTIONS], [2.0, TURN_RIGHT]):
             with self.assertRaises(ValueError):
                 env.step(bad)
 

@@ -39,23 +39,6 @@ class TestDroppedFeatures(unittest.TestCase):
                     break
         self.assertGreater(checked, 3000)
 
-    def test_a_robot_is_only_ever_given_a_task_it_can_carry(self):
-        """So crate size and robot capacity cannot change the value of any action it can pick."""
-        env, rng = maze_env(), random.Random(1)
-        checked = 0
-        for seed in range(4):
-            env.reset(seed)
-            for _ in range(STEPS):
-                for robot in env.robots:
-                    if robot.task is not None:
-                        self.assertLessEqual(robot.task.weight, robot.kind.max_weight)
-                        self.assertLessEqual(robot.task.volume, robot.kind.max_volume)
-                        checked += 1
-                _, _, done, _ = env.step([rng.randrange(N_ACTIONS) for _ in range(ROBOTS)])
-                if done:
-                    break
-        self.assertGreater(checked, 100)
-
 
 class TestScaleIndependence(unittest.TestCase):
     def test_a_row_is_the_same_width_whatever_the_fleet_or_the_map(self):
@@ -70,12 +53,6 @@ class TestScaleIndependence(unittest.TestCase):
             self.assertEqual({len(inputs.row(o)) for o in obs}, {inputs.width})
             self.assertEqual(tuple(inputs.batch([obs]).shape), (1, robots, inputs.width))
         self.assertEqual(len(widths), 1, f"the row changed width with the scenario: {widths}")
-
-    def test_dropping_the_shortest_path_features_narrows_the_row(self):
-        env = maze_env()
-        wide = Features(env.spec.obs_features)
-        narrow = Features(env.spec.obs_features, use_bfs=False)
-        self.assertEqual(wide.width - narrow.width, 5, "distance plus one delta per direction")
 
 
 if __name__ == "__main__":

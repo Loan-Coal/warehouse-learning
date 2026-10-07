@@ -20,13 +20,12 @@ from env.scenarios import SCENARIOS
 from rl.checkpoint import save_checkpoint
 from rl.cli import build_or_exit, env_args, layout_for, make_env, make_parser, parse, train_seeds
 from rl.loop import run_episode
+from rl.metrics import COUNTS, format_rates
 from rl.vecloop import train_vec
 
-# Append-only: older logs without the later columns still read back, and the first six
-# columns keep their meaning and order for anything that reads them by position.
-LOG_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return",
-              "mode", "epsilon", "p_expert", "loss",
-              "entropy", "clipfrac", "explained_var")
+# Every row has these, first and in this order. A policy's stats() keys follow, in the order
+# its first row gives them, so logs from different policies carry different extra columns.
+BASE_FIELDS = ("episode", "deliveries", "value", "blocked", "invalid", "mean_return", "mode", *COUNTS)
 
 
 def build_parser():
@@ -39,10 +38,10 @@ def build_parser():
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--envs", type=int, default=1, metavar="N",
                         help="train with N envs stepped together, so one network call serves all\n"
-                             "of them (rl/vecloop.py). 1 keeps the plain one-episode loop")
-    parser.add_argument("--total-steps", type=int, default=0, metavar="N",
-                        help="with --envs: also stop after N env steps, whichever comes first.\n"
-                             "This is the budget to size a run by; --episodes can stay large")
+                             "of them (rl/vecloop.py)")
+    parser.add_argument("--max-minutes", type=float, default=0, metavar="M",
+                        help="also stop after M wall-clock minutes (evaluation included), whichever\n"
+                             "comes first. --episodes stays the other limit, so set it high")
     parser.add_argument("--print-every", type=int, default=1, metavar="N", help="print every N-th episode")
     parser.add_argument("--eval-every", type=int, default=0, metavar="N",
                         help="with --train: every N episodes, play --eval-episodes without learning,\n"
@@ -74,27 +73,24 @@ def check_args(parser, args):
         parser.error("--eval-every needs --train (without it every episode is already an evaluation)")
     if args.eval_every < 0 or args.eval_episodes < 1:
         parser.error("--eval-every must be at least 0 and --eval-episodes at least 1")
-    if args.envs < 1 or args.total_steps < 0:
-        parser.error("--envs must be at least 1 and --total-steps at least 0")
+    if args.envs < 1 or args.max_minutes < 0:
+        parser.error("--envs must be at least 1 and --max-minutes at least 0")
     if args.envs > 1 and not args.train:
         parser.error("--envs only speeds up training; an evaluation plays one episode at a time")
     if args.envs > 1 and not args.no_render:
         parser.error("--envs cannot be rendered in the terminal: add --no-render")
-    if args.total_steps and args.envs == 1:
-        parser.error("--total-steps needs --envs (the plain loop counts episodes)")
     if args.eval_scenario and args.eval_scenario not in SCENARIOS:
         parser.error(f"unknown --eval-scenario '{args.eval_scenario}'; in env/scenarios.py: "
                      f"{', '.join(SCENARIOS)}")
     if args.eval_every:
-        # Held out means held out. Without this check a long --new-map run walks its layout seeds
-        # straight into the evaluation range and quietly starts training on the eval mazes.
+        # Held out means held out: a long --new-map run must not walk its layout seeds into the
+        # evaluation range, which would quietly train on the eval mazes.
         rounds = -(-args.episodes // args.envs)     # a map per round of --envs episodes
         train_lo, train_hi = train_seeds(args, rounds)
         eval_lo, eval_hi = args.eval_seed, args.eval_seed + args.eval_episodes - 1
         if train_lo <= eval_hi and eval_lo <= train_hi:
             parser.error(f"training maps (seeds {train_lo}-{train_hi}) overlap the evaluation maps "
-                         f"(seeds {eval_lo}-{eval_hi}): raise --eval-seed, or bound training's "
-                         f"range with --maze-pool")
+                         f"(seeds {eval_lo}-{eval_hi}): raise --eval-seed")
 
 
 def main():
@@ -107,52 +103,46 @@ def main():
         print(env.render() + "\n")
         time.sleep(args.delay)
 
+    render = None if args.no_render else show
+    if args.train:
+        train(args, env, policy, render)
+    else:
+        play(args, env, policy, render)
+
+
+def train(args, env, policy, show):
+    """Train through the vectorised loop, whatever --envs is: one path to keep correct."""
     log = TrainLog(args.save) if args.save else None
-    if args.envs > 1:
-        train_vec(args, env, policy, log, lambda episode: evaluate(env, policy, args, episode, log))
-        if log:
-            log.close()
-        if args.save:
-            save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args),
-                            episode=args.episodes, policy_opts=args.policy_opts)
-            print(f"saved checkpoint to {args.save}")
-        return
-    for k in range(args.episodes):
-        try:
-            layout = layout_for(args, k) if args.new_map else None
-        except ValueError as err:
-            parser.error(str(err))
-        stats = run_episode(env, policy, args.seed + k, args.train, None if args.no_render else show, layout)
-        if log:
-            log.write(k, dict(stats, **policy.stats()))
-        if (k + 1) % args.print_every == 0 or k == args.episodes - 1:
-            print(f"episode {k}: deliveries {stats['deliveries']}  value {stats['value']:.1f}  "
-                  f"blocked {stats['blocked']}  invalid {stats['invalid']}  mean return {stats['mean_return']:.2f}")
-        if args.eval_every and (k + 1) % args.eval_every == 0:
-            evaluate(env, policy, args, k + 1, log)
-        if args.snapshot_every and (k + 1) % args.snapshot_every == 0:
-            save_checkpoint(policy, Path(args.save) / f"ep_{k + 1:06d}", args.policy, env.n_robots,
-                            env_args(args), episode=k + 1, policy_opts=args.policy_opts)
+
+    def save(folder, episode):
+        save_checkpoint(policy, folder, args.policy, env.n_robots, env_args(args),
+                        episode=episode, policy_opts=args.policy_opts)
+
+    vec = train_vec(args, env, policy, log, lambda episode: evaluate(env, policy, args, episode, log),
+                    save, show)
     if log:
         log.close()
     if args.save:
-        save_checkpoint(policy, args.save, args.policy, env.n_robots, env_args(args),
-                        episode=args.episodes, policy_opts=args.policy_opts)
+        # vec.finished, not args.episodes: --max-minutes may have stopped the run first.
+        save(args.save, vec.finished)
         print(f"saved checkpoint to {args.save}")
 
 
+def play(args, env, policy, show):
+    """Evaluate or watch: no learning, one episode at a time."""
+    for k in range(args.episodes):
+        layout = layout_for(args, k) if args.new_map else None
+        stats = run_episode(env, policy, args.seed + k, False, show, layout)
+        if (k + 1) % args.print_every == 0 or k == args.episodes - 1:
+            print(f"episode {k}: deliveries {stats['deliveries']}  value {stats['value']:.1f}  "
+                  f"blocked {stats['blocked']}  invalid {stats['invalid']}  mean return {stats['mean_return']:.2f}")
+
+
 def evaluate(env, policy, args, episode, log):
-    """Play held-out episodes with learning, exploration and any teacher switched off.
+    """Play held-out episodes with learning and exploration switched off.
 
-    run_episode(train=False) sets policy.training = False and never calls update(), so this
-    measures the policy alone.
-
-    Evaluation gets its OWN env and an explicit map per episode. It used to be handed the
-    training env with layout=None, which means "keep whatever map is installed" -- so under
-    --new-map it measured the policy on the maze it had just finished training on, and the eval
-    map moved at every eval point, which made the curve incomparable with itself. Its own env is
-    also what lets evaluation use a different fleet or maze size than training, which is how the
-    generalisation numbers are measured.
+    Evaluation gets its OWN env and an explicit map per episode: layout=None would keep the
+    training map installed. Its own env also lets it use a different fleet or maze size.
     """
     settings = eval_settings(args)
     eval_env = make_env(settings, env.spec.obs_features, layout_for(settings, 0))
@@ -161,27 +151,23 @@ def evaluate(env, policy, args, episode, log):
             for j in range(args.eval_episodes)]
     if log:
         for row in rows:
-            # No policy.stats() here: epsilon/p_expert/loss describe the training schedule and
-            # would read as if they applied to these episodes.
-            log.write(episode, row, mode="eval")
+            log.write(episode, row, mode="eval")    # no policy.stats(): they describe training
     mean = {m: sum(r[m] for r in rows) / len(rows) for m in ("deliveries", "invalid", "mean_return")}
     print(f"  eval @ {episode}: deliveries {mean['deliveries']:.1f}  "
-          f"invalid {mean['invalid']:.0f}  mean return {mean['mean_return']:.2f}")
+          f"invalid {mean['invalid']:.0f}  mean return {mean['mean_return']:.2f}  {format_rates(rows)}")
 
 
 def eval_settings(args):
     """The env flags as evaluation sees them: held-out maps, optionally a different size or fleet.
 
     new_map is forced on whenever the map is random at all, so the evaluation mazes come from
-    --eval-seed rather than from training's seed. For a run that trained on one fixed maze that
-    turns evaluation into the more interesting question of whether the policy generalises off it.
+    --eval-seed. For a run that trained on one fixed maze this asks whether the policy generalises.
     """
     settings = argparse.Namespace(**vars(args))
     for key, value in SCENARIOS.get(args.eval_scenario or "", {}).items():
         setattr(settings, key, value)
     settings.seed = args.eval_seed
     settings.new_map = settings.map != "default"
-    settings.maze_pool = 0      # a pool would cycle; every eval episode gets its own map
     settings.robots = args.eval_robots or settings.robots
     settings.size = args.eval_size or settings.size
     return settings
@@ -194,11 +180,14 @@ class TrainLog:
         Path(folder).mkdir(parents=True, exist_ok=True)
         self.file = open(Path(folder) / "train_log.csv", "w", newline="", encoding="utf-8")
         self.writer = csv.writer(self.file)
-        self.writer.writerow(LOG_FIELDS)
+        self.fields = None
 
     def write(self, episode, stats, mode="train"):
-        row = dict(stats, mode=mode)
-        self.writer.writerow([episode] + [_cell(row.get(k)) for k in LOG_FIELDS[1:]])
+        row = dict(stats, mode=mode, episode=episode)
+        if self.fields is None:     # the policy's own columns are known from the first row
+            self.fields = BASE_FIELDS + tuple(k for k in row if k not in BASE_FIELDS)
+            self.writer.writerow(self.fields)
+        self.writer.writerow([_cell(row.get(k)) for k in self.fields])
         self.file.flush()   # so rl.plot works on a run that is still going
 
     def close(self):
@@ -206,7 +195,7 @@ class TrainLog:
 
 
 def _cell(value):
-    """A metric the policy did not report becomes an empty cell, not a crash."""
+    """A metric the row does not carry becomes an empty cell, not a crash."""
     if value is None:
         return ""
     return round(value, 4) if isinstance(value, float) else value

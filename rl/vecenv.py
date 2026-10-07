@@ -7,6 +7,7 @@ Not a faster simulator: K small network calls become one, which is where the tim
 and a learner needs the observation the episode ENDED on rather than the restarted one. step()
 returns both; getting this wrong is invisible.
 """
+from rl.metrics import EpisodeMetrics
 
 
 class VecWarehouse:
@@ -18,6 +19,7 @@ class VecWarehouse:
         self.episode = episode
         self.started = self.finished = self.steps = 0
         self.returns = [[] for _ in self.envs]
+        self.metrics = [EpisodeMetrics() for _ in self.envs]
 
     def reset(self):
         """Start an episode in every slot; returns one observation list per slot."""
@@ -31,17 +33,20 @@ class VecWarehouse:
         dones   whether each slot ran out of time
         ended   the observation the episode ended on, or None: the state to bootstrap from,
                 since obs has moved on to an unrelated episode
-        stats   one env.totals-plus-mean_return dict per episode that finished
+        stats   one dict per episode that finished: env.totals, mean_return, rl/metrics.py counts
         """
         obs, rewards, dones, ended, stats = [], [], [], [], []
         for slot, (env, act) in enumerate(zip(self.envs, actions)):
+            self.metrics[slot].observe(env, act)
             nxt, reward, done, _ = env.step(act)
+            self.metrics[slot].record(env)
             self.returns[slot] = [total + r for total, r in zip(self.returns[slot], reward)]
             rewards.append(reward)
             dones.append(done)
             if done:
                 stats.append(dict(env.totals,
-                                  mean_return=sum(self.returns[slot]) / len(self.returns[slot])))
+                                  mean_return=sum(self.returns[slot]) / len(self.returns[slot]),
+                                  **self.metrics[slot].totals()))
                 ended.append(nxt)
                 self.finished += 1
                 nxt = self._restart(slot)
@@ -57,4 +62,5 @@ class VecWarehouse:
         self.started += 1
         first = env.reset(seed, layout)
         self.returns[slot] = [0.0] * env.n_robots
+        self.metrics[slot].reset(env)
         return first

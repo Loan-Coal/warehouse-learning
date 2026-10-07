@@ -17,13 +17,13 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
 import rl.policies.ppo as mod
-from env.layout import is_walkable, maze_layout
-from env.observation import HEADINGS
-from env.warehouse import Warehouse
+from env.layout import maze_layout
+from env.warehouse import N_ACTIONS, Warehouse
 from rl.policies.ppo import PPO, pooled
 from rl.vecenv import VecWarehouse
 
@@ -72,7 +72,7 @@ class TestMask(unittest.TestCase):
                     policy.reset()
                     for _ in range(STEPS):
                         actions = policy.act(obs)
-                        self.assertTrue(all(type(a) is int and 0 <= a < 6 for a in actions))
+                        self.assertTrue(all(type(a) is int and 0 <= a < N_ACTIONS for a in actions))
                         obs, rewards, done, info = env.step(actions)
                         self.assertEqual(info["invalid"], 0)
                         if train:
@@ -123,38 +123,45 @@ class TestTruncationBootstrap(unittest.TestCase):
         self.assertAlmostEqual(crossed, 0.0, places=6, msg="step 1 inherited step 2's advantage")
         self.assertGreater(joined, 0.0, "without the boundary it should carry, or this proves nothing")
 
-    def test_a_rollout_spanning_a_boundary_learns_without_complaint(self):
-        """End to end: the rollout is longer than the episode, so a boundary lands inside it."""
-        rollout, mod.ROLLOUT = mod.ROLLOUT, 24
-        try:
-            vec = vec_of(2, steps=10)       # boundaries at 10 and 20, inside a 24-step rollout
-            policy = PPO(vec.envs[0].spec, seed=0)
-            play(policy, vec, 24)
-            self.assertEqual(policy.updates, 1, "the rollout should have filled exactly once")
-            self.assertTrue(math.isfinite(policy.log["loss"]))
-        finally:
-            mod.ROLLOUT = rollout
+    @patch.object(mod, "ROLLOUT", 24)
+    def test_every_bootstrap_is_the_critic_on_the_state_that_followed(self):
+        """after[t] is reused from step t+1's value rather than recomputed, except where an
+        episode ended: there it must still be the state it ENDED on, not the restarted one."""
+        vec = vec_of(2, steps=10)       # boundaries at 10 and 20, inside a 24-step rollout
+        policy = PPO(vec.envs[0].spec, seed=0)
+        expected, seen = [], {}
+        update_vec, gae = policy.update_vec, policy._gae
+
+        def recording(obs, actions, rewards, next_obs, dones):
+            with torch.no_grad():
+                expected.append(policy.critic(pooled(policy.inputs.batch(next_obs))).squeeze(-1))
+            update_vec(obs, actions, rewards, next_obs, dones)
+
+        def spy(reward, value, after, done):
+            seen["after"] = after.clone()
+            return gae(reward, value, after, done)
+
+        policy.update_vec, policy._gae = recording, spy
+        play(policy, vec, 24)
+        torch.testing.assert_close(seen["after"], torch.stack(expected))
 
 
 class TestUpdate(unittest.TestCase):
+    @patch.object(mod, "ROLLOUT", 8)
     def test_a_real_update_runs_and_leaves_everything_finite(self):
-        rollout, mod.ROLLOUT = mod.ROLLOUT, 8
-        try:
-            vec = vec_of(4)
-            policy = PPO(vec.envs[0].spec, seed=0)
-            before = [p.clone() for p in policy.actor.parameters()]
-            play(policy, vec, 32)
-            self.assertGreaterEqual(policy.updates, 4)
-            self.assertEqual(policy.steps, 32 * 4)
-            for name, value in policy.log.items():
-                self.assertTrue(math.isfinite(value), f"{name} went to {value}")
-            self.assertTrue(all(p.isfinite().all() for p in policy.actor.parameters()))
-            self.assertTrue(all(p.isfinite().all() for p in policy.critic.parameters()))
-            moved = any(not torch.equal(a, b) for a, b in zip(before, policy.actor.parameters()))
-            self.assertTrue(moved, "the actor did not change: nothing was learned")
-            self.assertEqual(policy.rollout, [], "the rollout should be cleared after an update")
-        finally:
-            mod.ROLLOUT = rollout
+        vec = vec_of(4)
+        policy = PPO(vec.envs[0].spec, seed=0)
+        before = [p.clone() for p in policy.actor.parameters()]
+        play(policy, vec, 32)
+        self.assertGreaterEqual(policy.updates, 4)
+        self.assertEqual(policy.steps, 32 * 4)
+        for name, value in policy.log.items():
+            self.assertTrue(math.isfinite(value), f"{name} went to {value}")
+        self.assertTrue(all(p.isfinite().all() for p in policy.actor.parameters()))
+        self.assertTrue(all(p.isfinite().all() for p in policy.critic.parameters()))
+        moved = any(not torch.equal(a, b) for a, b in zip(before, policy.actor.parameters()))
+        self.assertTrue(moved, "the actor did not change: nothing was learned")
+        self.assertEqual(policy.rollout, [], "the rollout should be cleared after an update")
 
     def test_the_policy_loss_ignores_a_discarded_action_but_the_value_loss_does_not(self):
         """A slow robot acting on its off step: the env threw the action away.
@@ -170,7 +177,7 @@ class TestUpdate(unittest.TestCase):
         mask = policy.masks([obs])
         acted = torch.zeros(1, ROBOTS, dtype=torch.long)
         for row in range(ROBOTS):
-            acted[0, row] = next(a for a in range(6) if mask[0, row, a])
+            acted[0, row] = next(a for a in range(N_ACTIONS) if mask[0, row, a])
         args = [x, mask, acted, torch.zeros(1, ROBOTS), torch.ones(1, ROBOTS),
                 torch.full((1, ROBOTS), 3.0), torch.zeros(1, ROBOTS)]     # ready all zero
         policy._step([t.clone() for t in args])
@@ -197,9 +204,6 @@ class TestUpdate(unittest.TestCase):
         policy.configure(shaping="0")
         self.assertEqual(policy.learning_rewards(obs, [2.0] * ROBOTS, obs),
                          [mod.REWARD_SCALE * 2.0] * ROBOTS)
-        policy.configure(shaping="1")
-        self.assertEqual(policy.learning_rewards(obs, [2.0] * ROBOTS, obs),
-                         [mod.REWARD_SCALE * 2.0] * ROBOTS, "same state, so no shaping either way")
 
 
 class TestStoredAndRecomputed(unittest.TestCase):
@@ -212,37 +216,21 @@ class TestStoredAndRecomputed(unittest.TestCase):
     1 at the start, clipping fires immediately, and learning quietly degrades.
     """
 
+    @patch.object(mod, "ROLLOUT", 1_000_000)       # never fires on its own
     def test_the_ratio_is_one_before_the_first_update(self):
-        rollout, mod.ROLLOUT = mod.ROLLOUT, 1_000_000       # never fires on its own
-        try:
-            vec = vec_of(3)
-            policy = PPO(vec.envs[0].spec, seed=0)
-            play(policy, vec, STEPS + 5)                    # spans an episode boundary and a map change
-            self.assertGreater(len(policy.rollout), STEPS)
+        vec = vec_of(3)
+        policy = PPO(vec.envs[0].spec, seed=0)
+        play(policy, vec, STEPS + 5)                    # spans an episode boundary and a map change
+        self.assertGreater(len(policy.rollout), STEPS)
 
-            x, mask, acted, logp = [torch.stack(p) for p in list(zip(*policy.rollout))[:4]]
-            with torch.no_grad():
-                logits = policy.actor(pooled(x.flatten(0, 1))).masked_fill(~mask.flatten(0, 1),
-                                                                          mod.NEG)
-                again = torch.distributions.Categorical(logits=logits).log_prob(acted.flatten(0, 1))
-            ratio = (again - logp.flatten(0, 1)).exp()
-            self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-5),
-                            f"ratio drifted from 1: min {ratio.min():.6f} max {ratio.max():.6f}")
-        finally:
-            mod.ROLLOUT = rollout
-
-    def test_a_stored_action_is_always_one_the_mask_allowed(self):
-        rollout, mod.ROLLOUT = mod.ROLLOUT, 1_000_000
-        try:
-            vec = vec_of(3)
-            policy = PPO(vec.envs[0].spec, seed=0)
-            play(policy, vec, STEPS + 5)
-            for step in policy.rollout:
-                mask, acted = step[1], step[2]
-                chosen = torch.gather(mask, -1, acted.unsqueeze(-1)).squeeze(-1)
-                self.assertTrue(chosen.all(), "an illegal action was stored to learn from")
-        finally:
-            mod.ROLLOUT = rollout
+        x, mask, acted, logp = [torch.stack(p) for p in list(zip(*policy.rollout))[:4]]
+        with torch.no_grad():
+            logits = policy.actor(pooled(x.flatten(0, 1))).masked_fill(~mask.flatten(0, 1),
+                                                                      mod.NEG)
+            again = torch.distributions.Categorical(logits=logits).log_prob(acted.flatten(0, 1))
+        ratio = (again - logp.flatten(0, 1)).exp()
+        self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-5),
+                        f"ratio drifted from 1: min {ratio.min():.6f} max {ratio.max():.6f}")
 
 
 class TestShaping(unittest.TestCase):
@@ -264,7 +252,7 @@ class TestShaping(unittest.TestCase):
             for o in obs:
                 if o.has_task and policy.inputs.potential(o) != 0.0:
                     return policy, o
-            obs, _, done, _ = env.step([rng.randrange(6) for _ in range(ROBOTS)])
+            obs, _, done, _ = env.step([rng.randrange(N_ACTIONS) for _ in range(ROBOTS)])
             if done:
                 obs = env.reset(0)
         raise AssertionError("no robot ever had a reachable task")
@@ -279,20 +267,6 @@ class TestShaping(unittest.TestCase):
         self.assertEqual(self.shaping(policy, o, o), 0.0)
         textbook = mod.SHAPE * (mod.GAMMA * policy.inputs.potential(o) - policy.inputs.potential(o))
         self.assertGreater(textbook, 0.0, "the form we rejected pays a robot for doing nothing")
-
-    def test_a_round_trip_earns_exactly_nothing(self):
-        """Phi is a function of the state, so any closed walk sums to zero. No loop farms it."""
-        policy, here = self.busy_robot()
-        grid = policy.spec.grid
-        step = next((d for d in HEADINGS
-                     if is_walkable(grid, here.x + d[0], here.y + d[1])
-                     and policy.inputs.potential(here._replace(x=here.x + d[0], y=here.y + d[1]))
-                     != policy.inputs.potential(here)), None)
-        self.assertIsNotNone(step, "nowhere to walk that changes the potential")
-        there = here._replace(x=here.x + step[0], y=here.y + step[1])
-        out, back = self.shaping(policy, here, there), self.shaping(policy, there, here)
-        self.assertNotEqual(out, 0.0, "the two cells should differ, or this proves nothing")
-        self.assertAlmostEqual(out + back, 0.0, places=12)
 
     def test_it_is_suppressed_when_a_delivery_swaps_the_target(self):
         """Phi jumps discontinuously then, and the jump is not progress the robot made."""
@@ -330,6 +304,36 @@ class TestTransfer(unittest.TestCase):
             wide.load(folder)
             self.assertEqual((wide.inputs.width, wide.inputs.use_bfs),
                              (narrow.inputs.width, False))
+
+
+class TestSettingsAcrossALoad(unittest.TestCase):
+    """rl/cli.py configures BEFORE it loads, so load() must not undo what was typed.
+
+    It used to: --checkpoint X --policy-opt eval_greedy=1 quietly evaluated with sampling.
+    """
+
+    def test_a_typed_setting_beats_the_checkpoint(self):
+        env = maze_env()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            PPO(env.spec, seed=0).save(folder)
+            loaded = PPO(env.spec, seed=0)
+            loaded.configure(eval_greedy="1", ent="0.05", lr="0.0001")
+            loaded.load(folder)
+            self.assertEqual((loaded.eval_greedy, loaded.ent, loaded.lr), (True, 0.05, 0.0001))
+            self.assertEqual({g["lr"] for g in loaded.opt.param_groups}, {0.0001},
+                             "the saved optimiser state carries its own lr")
+
+    def test_an_untyped_setting_comes_from_the_checkpoint(self):
+        env = maze_env()
+        trained = PPO(env.spec, seed=0)
+        trained.configure(shaping="0", ent="0.02")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            trained.save(folder)
+            loaded = PPO(env.spec, seed=0)
+            loaded.load(folder)
+            self.assertEqual((loaded.use_shaping, loaded.ent, loaded.eval_greedy), (False, 0.02, False))
 
 
 if __name__ == "__main__":

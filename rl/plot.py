@@ -2,8 +2,6 @@
 
     python -m rl.plot checkpoints/myalgo                       # learning curve -> checkpoints/myalgo/learning_curve.png
     python -m rl.plot checkpoints/a checkpoints/b              # several runs on one chart per metric
-
-rl.bench draws its own chart with bench_chart().
 """
 import argparse
 import csv
@@ -18,7 +16,6 @@ import matplotlib.pyplot as plt  # noqa: E402
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 CURVE_METRICS = ("deliveries", "invalid", "mean_return")
-BENCH_METRICS = ("deliveries", "value", "blocked", "invalid")
 
 
 def main():
@@ -81,29 +78,6 @@ def _eval_series(rows, metric):
             by_episode.setdefault(int(r["episode"]), []).append(float(r[metric]))
     episodes = sorted(by_episode)
     return episodes, [sum(by_episode[e]) / len(by_episode[e]) for e in episodes]
-
-
-def bench_chart(rows, out):
-    """rows: rl.bench result rows. One panel per metric: mean per scenario, one bar per algorithm."""
-    algorithms = list(dict.fromkeys(r["algorithm"] for r in rows))[:len(SERIES)]
-    scenarios = list(dict.fromkeys(r["scenario"] for r in rows))
-    fig, axes = plt.subplots(1, len(BENCH_METRICS), figsize=(4.2 * len(BENCH_METRICS), 3.8))
-    width = 0.8 / len(algorithms)
-    for ax, metric in zip(axes, BENCH_METRICS):
-        for a, (algorithm, color) in enumerate(zip(algorithms, SERIES)):
-            means = []
-            for scenario in scenarios:
-                values = [float(r[metric]) for r in rows if r["algorithm"] == algorithm and r["scenario"] == scenario]
-                means.append(sum(values) / len(values) if values else 0.0)
-            xs = [s + (a - (len(algorithms) - 1) / 2) * width for s in range(len(scenarios))]
-            # White edges leave a gap between neighbouring bars.
-            ax.bar(xs, means, width, color=color, edgecolor="white", linewidth=2, label=algorithm)
-        ax.set_xticks(range(len(scenarios)), scenarios)
-        _style(ax, f"{metric} (mean per episode)", None)
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper right", ncol=len(algorithms),
-               frameon=False, labelcolor=INK)
-    fig.suptitle("Benchmark", color=INK, x=0.01, ha="left")
-    _save(fig, out)
 
 
 def _moving_average(values, window):

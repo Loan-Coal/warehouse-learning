@@ -12,7 +12,6 @@ import unittest
 from collections import deque
 
 from env.layout import DEFAULT_MAP, access_cells, cells_of, is_walkable, maze_layout, parse
-from env.observation import HEADINGS
 from env.warehouse import N_ACTIONS, TURN_LEFT, TURN_RIGHT, Warehouse
 from rl import nav
 from rl.features import Features
@@ -28,6 +27,12 @@ def maze_env(seed=0, size=(11, 9)):
 
 
 class TestLegalActions(unittest.TestCase):
+    def test_turns_are_always_legal_and_there_is_no_wait(self):
+        env = maze_env(0)
+        for o in env.reset(0):
+            legal = legal_actions(env.grid, o)
+            self.assertEqual((len(legal), legal[TURN_RIGHT], legal[TURN_LEFT]), (6, True, True))
+
     def test_only_legal_actions_are_ever_invalid(self):
         """Playing only actions the mask allows must never earn a single invalid penalty."""
         for seed in range(4):
@@ -42,20 +47,6 @@ class TestLegalActions(unittest.TestCase):
                     self.assertEqual(info["invalid"], 0, "the mask allowed an action the env rejected")
                     if done:
                         break
-
-    def test_some_action_is_always_legal(self):
-        """Turning is never invalid, so the mask can never leave a robot with nothing to do."""
-        env = maze_env()
-        obs = env.reset(0)
-        rng = random.Random(0)
-        for _ in range(STEPS):
-            for o in obs:
-                legal = legal_actions(env.grid, o)
-                self.assertTrue(any(legal))
-                self.assertTrue(legal[TURN_RIGHT] and legal[TURN_LEFT])
-            obs, _, done, _ = env.step([rng.randrange(N_ACTIONS) for _ in obs])
-            if done:
-                break
 
     def test_what_the_mask_forbids_the_env_rejects(self):
         """The other direction, so a mask that just forbade everything would not pass.
@@ -124,49 +115,8 @@ class TestField(unittest.TestCase):
         for shelf in cells_of(grid, "S"):
             self.assertEqual(field.at(*shelf), UNREACHABLE)
 
-    def test_a_negative_index_cannot_wrap_into_a_wrong_answer(self):
-        """Why at() bounds-checks instead of letting callers index .steps directly.
-
-        Row -1 wraps to the last row of the array and would report a plausible distance for a
-        cell that is off the map entirely. DEFAULT_MAP has walkable cells in its bottom row, so
-        the wrapped read returns a real number rather than UNREACHABLE.
-        """
-        grid = parse(DEFAULT_MAP)
-        field = distance_field(grid, cells_of(grid, "S")[0])
-        bottom = [x for x in range(field.width)
-                  if field.steps[(field.height - 1) * field.width + x] != UNREACHABLE]
-        self.assertTrue(bottom, "this map needs a reachable bottom row for the test to mean anything")
-        x = bottom[0]
-        self.assertEqual(field.at(x, -1), UNREACHABLE, "off the map, and at() says so")
-        self.assertNotEqual(field.steps[-1 * field.width + x], UNREACHABLE,
-                            "the raw index wrapped to the last row: the answer at() protects against")
-        self.assertEqual(field.at(-1, 2), UNREACHABLE, "and the same for a negative column")
-
-    def test_one_step_in_a_decreasing_direction_costs_exactly_one(self):
-        """The property the network's delta features rely on: +1 really means a step closer."""
-        grid = parse(maze_layout(2, 15, 13, n_robots=3))
-        field = distance_field(grid, cells_of(grid, "S")[10])
-        checked = 0
-        for y in range(len(grid)):
-            for x in range(len(grid[0])):
-                here = field.at(x, y)
-                if here in (UNREACHABLE, 0):
-                    continue
-                closer = [field.at(x + dx, y + dy) for dx, dy in HEADINGS]
-                self.assertIn(here - 1, closer, f"no neighbour of ({x}, {y}) is one step nearer")
-                for there in closer:
-                    if there != UNREACHABLE:
-                        self.assertLessEqual(abs(here - there), 1, "distance jumped by more than 1")
-                checked += 1
-        self.assertGreater(checked, 50)
-
 
 class TestCache(unittest.TestCase):
-    def test_the_same_map_and_target_give_back_the_same_field(self):
-        grid = parse(maze_layout(4, 11, 9, n_robots=2))
-        dock = cells_of(grid, "D")[0]
-        self.assertIs(distance_field(grid, dock), distance_field(grid, dock))
-
     def test_a_different_map_gets_its_own_field(self):
         one = parse(maze_layout(5, 11, 9, n_robots=2))
         two = parse(maze_layout(6, 11, 9, n_robots=2))

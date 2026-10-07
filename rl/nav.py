@@ -17,12 +17,12 @@ _FIELDS = {}
 
 
 def legal_actions(grid, o):
-    """Which of the 6 actions the env would actually carry out, for one robot.
+    """Which of the N_ACTIONS actions the env would actually carry out, for one robot.
 
     PICKUP/DROPOFF need the robot to FACE its target, and obs.target is already the pickup cell
     while empty and the dropoff while carrying, so one comparison covers both. A turn is never
-    invalid, so some action is always legal. Stepping into a human is legal too: R_BLOCKED, not
-    R_INVALID.
+    invalid, so some action is always legal. Stepping into a human is legal too: R_BLOCKED,
+    not R_INVALID.
     """
     dx, dy = HEADINGS[o.heading]
     front, back, target = (o.x + dx, o.y + dy), (o.x - dx, o.y - dy), (o.target_x, o.target_y)
@@ -38,9 +38,8 @@ def legal_actions(grid, o):
 class Field:
     """Steps from every cell of one map to one target, indexed by y * width + x.
 
-    17x less memory than the dict it replaces and 1.6x faster to build, though at() is ~3.8x
-    slower than dict.get. Building dominates. Never index .steps directly: a neighbour can be off
-    the map, and the negative index would wrap into the opposite row (tests/test_nav.py).
+    Never index .steps directly: a neighbour can be off the map, and a negative index would wrap
+    into the opposite row. at() bounds-checks.
     """
     __slots__ = ("width", "height", "steps")
 

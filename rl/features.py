@@ -16,6 +16,7 @@ from rl.nav import UNREACHABLE, distance_field
 # VIEW mirrors Warehouse(view_range=5), which EnvSpec does not carry: another value would push
 # dist / VIEW quietly past 1.0.
 VIEW, RAY_TYPES = 5, HUMAN + 1          # ray range, and the ray types (0 = nothing .. 6 = human)
+PRIORITY_MAX = 3                        # env jobs draw a priority in 1..3 (env/warehouse.py)
 
 torch.set_num_threads(min(8, os.cpu_count() or 1))      # measured best; see LEARNINGS.md
 
@@ -45,16 +46,8 @@ class Features:
     def use(self, grid):
         self.grid, self.w, self.h = grid, len(grid[0]), len(grid)
 
-    def fleet(self, obs):
-        """[robots, width] for one env."""
-        return torch.tensor([self.row(o) for o in obs], dtype=torch.float32)
-
     def batch(self, obs_per_env):
-        """[envs, robots, width], the shape the networks want.
-
-        Not a speed-up: 1.00x against per-env fleet() calls, because 83% of the cost is the
-        Python loop in row() -- now the biggest single cost in a training step (LEARNINGS.md).
-        """
+        """[envs, robots, width], the shape the networks want. Dominated by the Python loop in row()."""
         return torch.tensor([[self.row(o) for o in one] for one in obs_per_env],
                             dtype=torch.float32)
 
@@ -67,7 +60,7 @@ class Features:
         dx, dy = o.target_x - o.x, o.target_y - o.y
         v = [o.x / self.w, o.y / self.h, dx / self.w, dy / self.h,
              float(o.carrying), float(o.has_task), float(faces_target(o)),
-             o.priority / 3, task_value(o) / 3,
+             o.priority / PRIORITY_MAX, task_value(o) / PRIORITY_MAX,
              float(o.ready), float(max(o.period - 1, 0))]
         v += one_hot(o.heading, 4)
         for dist, kind in ((o.front_d, o.front_t), (o.right_d, o.right_t),

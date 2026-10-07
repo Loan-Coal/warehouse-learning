@@ -19,6 +19,7 @@ from env.observation import (DEFAULT_OBS, DOWN, EMPTY_SHELF, FULL_SHELF, HEADING
 # on another version are refused, because their weights no longer mean anything.
 CONTRACT_VERSION = 2
 
+# There is no wait: standing still means turning in place (a WAIT was tried and removed 2026-10-07).
 N_ACTIONS = 6
 PICKUP, DROPOFF, TURN_RIGHT, TURN_LEFT, FORWARD, BACKWARD = range(N_ACTIONS)
 ACTION_NAMES = ("pickup", "dropoff", "turn_right", "turn_left", "forward", "backward")

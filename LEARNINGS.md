@@ -102,6 +102,10 @@ Most of these cost a training run to find out. The code points here instead of r
   forward is ~4% of an env step and the **Python floor is 94%**: features 119 µs/fleet, masks
   27 µs, `env.step` 153 µs.
 - So the RTX 5070 Ti stays unused — moving 18 µs to a GPU cannot pay for the transfers.
+- `V(s')` for the GAE target is the next step's `act_vec` value, reused rather than recomputed (only at an
+  episode boundary and the last step of a rollout is the critic run again). Building the features twice per
+  step cost 17% of training time: 1248 → ~1510 steps/s at `big`, 16 envs.
+- `Features.batch` is not a speed-up over per-env calls (1.00x): 83% of its cost is the Python loop in `row()`.
 - Next real lever: `Features.row`. At 16 envs × 6 robots its Python loop costs ~950 µs per
   vectorised step, more than `env.step`. Not done.
 - `torch.set_num_threads(8)`: 0.457 s/episode against 0.536 at 16 and 0.774 at 1.
@@ -116,3 +120,43 @@ Most of these cost a training run to find out. The code points here instead of r
   `max_steps × -0.05` whatever the policy does.
 - Training and eval maps must be disjoint *by construction*. `rl.run` refuses to start if the seed
   ranges could overlap, because the failure is otherwise silent.
+- **The `episode N:` training line is one map.** With 16 envs in lockstep it averages the 16
+  episodes of one round, which share a maze; maze difficulty alone moves it ±4.1 deliveries. Read
+  the `eval @` line (100 held-out mazes) or `train_log.csv` over thousands of rows.
+
+## How cleanly the fleet moves (rl/metrics.py)
+
+- Deliveries cannot show the goal "never undo a move". `rl/metrics.py` logs, for every policy
+  and in every row: `job_ratio` (a job's actions / the fewest a lone robot needs, turns included,
+  from a BFS over (x, y, heading)), `undone_rate` (a turn straight back, per acting step),
+  `crowded_share` (of those, with a robot or human within 2 cells of the next path cell) and
+  `reversal_rate` (stepping back to the cell just left; backing out after a pickup is exempt).
+- Before contract v3, 100 held-out `big` mazes:
+
+  | | deliveries | job_ratio | undone_rate | crowded_share | reversal_rate |
+  |---|---|---|---|---|---|
+  | greedy | 10.6 | 2.12 | 0.048 | 0.58 | 0.340 |
+  | PPO, 12 h (155k episodes) | 18.3 | 1.50 | 0.085 | **0.985** | 0.081 |
+
+- **PPO's dithering is waiting.** "Someone near" holds on ~50% of all acting steps for both
+  policies, but on 98.5% of PPO's undone turns. With no wait action, turning away and back is
+  the only way to stand still — the case for adding WAIT.
+- **Greedy oscillates.** A third of its moves step straight back: it plans around every robot its
+  rays see, each move changes what they see, and it flips between two paths for dozens of steps.
+  Its 2.1x job ratio is that, not bad routing.
+- 5% of eval time; the per-map state graph is built once per round of `--envs` episodes.
+- **Contract v3 adds `WAIT`** (action 6, appended so 0–5 keep their meaning): no move, no turn,
+  only `R_STEP`. Every v2 checkpoint, `ppo_12h` included, is refused. Greedy's idle robots now
+  wait instead of spinning: 10.9 deliveries, job ratio 2.08 — the same within noise.
+- **B0 (v3 PPO, 10k episodes, 2 seeds):** sampled 15.8 / 16.8 deliveries against 13.6 for v2 at
+  the same 10k, the level v2 reached only at ~50k. Undone turns 0.085 → 0.02-0.03, reversals
+  0.081 → 0.04-0.06; robots with a job wait on 17-21% of acting steps.
+- **With WAIT, argmax deadlocks.** Argmax drops B0 to 11.5 / 13.4 deliveries while its wait rate
+  nearly doubles (0.21 → 0.39, 0.17 → 0.29): identical weights facing each other both choose to
+  wait. Under v2 argmax cost ~1 delivery; now ~4. Sampling is what breaks the standoff, so the
+  deadlock argument for sampled evaluation matters more than before.
+- **WAIT removed again (decision 2026-10-07).** The env is back on contract v2: six actions, and
+  standing still means turning in place. The v3 numbers above stay as history; v3 checkpoints
+  (`b0_*`, `ent0*_*`) are refused, and the comparison runs that follow are all on v2.
+- `--policy-opt` given with `--checkpoint` used to be silently overwritten by the checkpoint's
+  saved settings (PPO.load ran after configure). Fixed; typed settings now win, except `bfs`.

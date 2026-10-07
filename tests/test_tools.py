@@ -12,7 +12,7 @@ from rl.cli import build, env_args, layout_for, make_parser, parse, train_seeds
 from rl.loop import run_episode
 from rl.policies import POLICIES
 from rl.policy import Policy
-from rl.run import build_parser, check_args, eval_settings
+from rl.run import BASE_FIELDS, build_parser, check_args, eval_settings
 from rl.run import evaluate as run_evaluate     # rl.bench.evaluate is imported above under its own name
 
 
@@ -79,12 +79,7 @@ class TestFlags(unittest.TestCase):
 
 
 class TestHeldOutEvaluation(unittest.TestCase):
-    """Evaluation must never replay a training map.
-
-    rl.run used to hand evaluate() the training env with layout=None, which means "keep whatever
-    map is installed", so under --new-map it measured the policy on the maze it had just trained
-    on. Every number from such a run is meaningless, and nothing failed when it happened.
-    """
+    """Evaluation must never replay a training map (nothing fails if it does: the numbers are just wrong)."""
 
     def args(self, *argv):
         return parse(build_parser(), [*argv, "--no-render"])
@@ -114,31 +109,19 @@ class TestHeldOutEvaluation(unittest.TestCase):
         settings = eval_settings(args)
         self.assertEqual((settings.robots, tuple(settings.size), settings.humans), (6, (21, 21), 3))
 
-    def test_maze_pool_bounds_the_training_seeds(self):
-        args = self.args("--maze", "--new-map", "--maze-pool", "4", "--train", "--episodes", "10")
-        maps = [layout_for(args, k) for k in range(10)]
-        self.assertEqual(len(set(maps)), 4, "the pool should cycle")
-        self.assertEqual(maps[0], maps[4])
-        self.assertEqual(train_seeds(args, 10), (0, 3))
-        self.assertEqual(train_seeds(self.args("--maze", "--new-map", "--episodes", "10"), 10), (0, 9))
-
     def test_training_maps_running_into_the_eval_maps_is_refused(self):
         parser = build_parser()
         args = parse(parser, ["--scenario", "hard", "--new-map", "--train", "--episodes", "200",
                               "--eval-every", "50", "--eval-seed", "100", "--no-render"])
+        self.assertEqual(train_seeds(args, 200), (0, 199))
         with self.assertRaises(SystemExit):
             check_args(parser, args)
-        bounded = parse(parser, ["--scenario", "hard", "--new-map", "--maze-pool", "50", "--train",
-                                 "--episodes", "200", "--eval-every", "50", "--eval-seed", "100",
-                                 "--no-render"])
-        check_args(parser, bounded)      # a pool keeps training below --eval-seed
+        short = parse(parser, ["--scenario", "hard", "--new-map", "--train", "--episodes", "50",
+                               "--eval-every", "50", "--eval-seed", "100", "--no-render"])
+        check_args(parser, short)      # seeds 0-49 stay below --eval-seed
 
     def test_evaluate_plays_the_held_out_maps_and_not_the_training_one(self):
-        """The regression test for the actual bug: evaluate() inheriting the training map.
-
-        eval_settings() producing disjoint maps is not enough -- evaluate() has to use them. The
-        old code called run_episode(..., layout=None), which keeps whatever map is installed.
-        """
+        """eval_settings() producing disjoint maps is not enough: evaluate() has to play them."""
         parser = build_parser()
         args = parse(parser, ["--scenario", "hard", "--new-map", "--train", "--episodes", "4",
                               "--max-steps", "20", "--eval-every", "4", "--eval-episodes", "3",
@@ -201,15 +184,67 @@ class TestPipeline(unittest.TestCase):
             rows = evaluate(f"template={folder}", "basic", 2, 1000)
             self.assertEqual([r["episode"] for r in rows], [0, 1])
             self.assertEqual(rows, evaluate(f"template={folder}", "basic", 2, 1000), "same seeds, same result")
+            run("rl.bench", "greedy", f"template={folder}", "--scenarios", "basic", "humans",
+                "--episodes", "2", "--out", str(Path(tmp, "bench")))
+            self.assertTrue(Path(tmp, "bench.csv").is_file())
             try:
                 import matplotlib  # noqa: F401
             except ImportError:
                 self.skipTest("matplotlib not installed")
-            run("rl.bench", "greedy", f"template={folder}", "--scenarios", "basic", "humans",
-                "--episodes", "2", "--out", str(Path(tmp, "bench")))
-            self.assertTrue(Path(tmp, "bench.csv").is_file() and Path(tmp, "bench.png").is_file())
             run("rl.plot", str(folder))
             self.assertTrue((folder / "learning_curve.png").is_file())
+
+
+class TestBenchPolicyOpts(unittest.TestCase):
+    """--policy-opt in rl.bench: how evaluation with argmax actions (eval_greedy=1) is benchmarked."""
+
+    def test_an_opt_reaches_the_policy(self):
+        rows = evaluate("ppo", "basic", 1, 1000, policy_opts=["eval_greedy=1"])
+        self.assertEqual(len(rows), 1)
+
+    def test_an_opt_beats_the_checkpoint_it_is_typed_over(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run("rl.run", "--policy", "ppo", "--train", "--max-steps", "10", "--episodes", "1",
+                "--no-render", "--save", tmp)
+            args = parse(make_parser(), ["--checkpoint", tmp, "--policy-opt", "eval_greedy=1"])
+            _, policy = build(args)
+            self.assertTrue(policy.eval_greedy, "the checkpoint's eval_greedy=False won")
+
+    def test_an_opt_the_policy_does_not_take_is_refused_by_name(self):
+        with self.assertRaisesRegex(ValueError, "eval_greedy"):
+            evaluate("greedy", "basic", 1, 1000, policy_opts=["eval_greedy=1"])
+
+
+class TestTraining(unittest.TestCase):
+    def test_a_log_has_the_policys_own_columns_after_the_base_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run("rl.run", "--policy", "ppo", "--train", "--max-steps", "10", "--episodes", "2",
+                "--no-render", "--save", tmp)
+            with open(Path(tmp, "train_log.csv"), encoding="utf-8") as f:
+                header = next(csv.reader(f))
+            base = len(BASE_FIELDS)
+            self.assertEqual(header[:base], list(BASE_FIELDS))
+            self.assertEqual(header[base:], ["loss", "entropy", "clipfrac", "explained_var"])
+
+    def test_training_can_be_watched_in_the_terminal(self):
+        out = run("rl.run", "--policy", "greedy", "--train", "--max-steps", "3", "--episodes", "1",
+                  "--delay", "0")
+        self.assertEqual(out.count("legend:"), 3, "one rendered frame per step")
+
+
+class TestMaxMinutes(unittest.TestCase):
+    def test_a_negative_budget_is_refused(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            check_args(parser, parse(parser, ["--train", "--max-minutes", "-1", "--no-render"]))
+
+    def test_the_checkpoint_records_the_episodes_actually_played(self):
+        """A run stopped by the clock played fewer episodes than --episodes allowed, in whole rounds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run("rl.run", "--policy", "ppo", "--train", "--envs", "2", "--max-steps", "10",
+                "--episodes", "100000", "--max-minutes", "0.03", "--no-render", "--save", tmp)
+            played = read_meta(tmp)["episode"]
+            self.assertTrue(0 < played < 100000 and played % 2 == 0, played)
 
 
 if __name__ == "__main__":

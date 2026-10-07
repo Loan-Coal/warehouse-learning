@@ -3,8 +3,7 @@
     python -m rl.bench greedy myalgo=checkpoints/myalgo --scenarios basic mixed hard --episodes 50
 
 Each entry is a registered policy name, or name=CHECKPOINT_FOLDER for a trained model
-(a colleague's folder works as-is). Prints a table, and writes
-results/bench.csv (one row per episode) and results/bench.png (one chart per metric).
+(a colleague's folder works as-is). Prints a table, and writes results/bench.csv (one row per episode).
 """
 import argparse
 import csv
@@ -14,8 +13,10 @@ from pathlib import Path
 from env.scenarios import SCENARIOS
 from rl.cli import layout_for, make_parser, parse, build
 from rl.loop import run_episode
+from rl.metrics import COUNTS, rates
 
 METRICS = ("deliveries", "value", "blocked", "invalid", "mean_return")
+RATES = ("job_ratio", "undone_rate", "crowded_share", "reversal_rate")
 
 
 def main():
@@ -27,7 +28,10 @@ def main():
     parser.add_argument("--new-map", action="store_true",
                         help="a new maze every episode (seed + k), the same maps rl.run evaluates\n"
                              "on. Use --seed 90000 to land on the held-out ones")
-    parser.add_argument("--out", default="results/bench", help="writes OUT.csv and OUT.png")
+    parser.add_argument("--out", default="results/bench", help="writes OUT.csv")
+    parser.add_argument("--policy-opt", action="append", default=[], metavar="KEY=VALUE",
+                        help="passed to every entry, on top of a checkpoint's own (e.g. eval_greedy=1\n"
+                             "for PPO's argmax actions); an entry that does not take it is skipped")
     args = parser.parse_args()
     unknown = [s for s in args.scenarios if s not in SCENARIOS]
     if unknown or args.episodes < 1:
@@ -37,7 +41,8 @@ def main():
     for entry in args.entries:
         for scenario in args.scenarios:
             try:
-                rows += evaluate(entry, scenario, args.episodes, args.seed, args.new_map)
+                rows += evaluate(entry, scenario, args.episodes, args.seed, args.new_map,
+                                 args.policy_opt)
             except ValueError as err:
                 print(f"skipped {entry} on {scenario}: {err}")
     if not rows:
@@ -46,25 +51,20 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out.with_suffix(".csv"), "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["algorithm", "scenario", "episode", *METRICS])
+        writer = csv.DictWriter(f, fieldnames=["algorithm", "scenario", "episode", *METRICS, *COUNTS])
         writer.writeheader()
         writer.writerows(rows)
     print(f"wrote {out.with_suffix('.csv')}")
-    try:
-        from rl.plot import bench_chart
-    except ImportError:
-        print("matplotlib is not installed (pip install -r requirements.txt): no chart")
-        return
-    bench_chart(rows, out.with_suffix(".png"))
-    print(f"wrote {out.with_suffix('.png')}")
 
 
-def evaluate(entry, scenario, episodes, seed, new_map=False):
+def evaluate(entry, scenario, episodes, seed, new_map=False, policy_opts=()):
     """Per-episode result rows for one algorithm on one scenario."""
     name, _, checkpoint = entry.partition("=")
     argv = ["--scenario", scenario, "--seed", str(seed)]
     if new_map:
         argv += ["--new-map"]
+    for opt in policy_opts:
+        argv += ["--policy-opt", opt]
     if name:
         argv += ["--policy", name]
     if checkpoint:
@@ -77,7 +77,8 @@ def evaluate(entry, scenario, episodes, seed, new_map=False):
         layout = layout_for(args, k) if args.new_map else None
         stats = run_episode(env, policy, args.seed + k, train=False, layout=layout)
         rows.append({"algorithm": entry, "scenario": scenario, "episode": k,
-                     **{m: round(stats[m], 4) for m in METRICS}})
+                     **{m: round(stats[m], 4) for m in METRICS},
+                     **{c: stats[c] for c in COUNTS}})
     return rows
 
 
@@ -102,6 +103,13 @@ def print_table(rows):
             cells.append(f"{statistics.mean(values):>10.2f} +- {spread:<5.2f}")
         print(f"{algorithm:<{width}}{scenario:<11}" + "".join(cells))
     print("(mean +- std over episodes; value = priority-weighted deliveries)\n")
+    print(f"{'algorithm':<{width}}{'scenario':<11}" + "".join(f"{r:>15}" for r in RATES))
+    for (algorithm, scenario), group in groups.items():
+        pooled = rates(group)
+        cells = ["-" if pooled[r] is None else f"{pooled[r]:.3f}" for r in RATES]
+        print(f"{algorithm:<{width}}{scenario:<11}" + "".join(f"{c:>15}" for c in cells))
+    print("(pooled over all episodes, rl/metrics.py. job_ratio: actual / fewest actions per job;\n"
+          " undone_rate: turns undone at once, per acting step; crowded_share: of those, someone near)\n")
 
 
 if __name__ == "__main__":

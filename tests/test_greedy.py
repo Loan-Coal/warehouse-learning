@@ -3,8 +3,8 @@ import unittest
 
 from env.layout import DEFAULT_MAP, maze_layout, random_layout
 from env.observation import obs_type
-from env.warehouse import (BACKWARD, DOWN, FORWARD, LEFT, PICKUP, RIGHT, TURN_LEFT, TURN_RIGHT, UP, EnvSpec,
-                           Warehouse)
+from env.warehouse import (BACKWARD, DOWN, FORWARD, LEFT, PICKUP, RIGHT, TURN_LEFT, TURN_RIGHT, UP,
+                           EnvSpec, Warehouse)
 from rl.loop import run_episode
 from rl.policies import POLICIES
 from rl.policies.greedy import GreedyRule
@@ -57,7 +57,7 @@ class TestGreedy(unittest.TestCase):
         self.assertEqual(policy.act_one(obs(3, 0, RIGHT, 0, 1, 3, 1)), TURN_RIGHT)
         self.assertEqual(policy.act_one(obs(3, 0, LEFT, 0, 1, 3, 1)), TURN_LEFT)
         self.assertEqual(policy.act_one(obs(3, 0, DOWN, 0, 1, 3, 1)), PICKUP)
-        self.assertEqual(policy.act_one(obs(3, 0, DOWN, 0, 0, 3, 0)), TURN_RIGHT)  # idle turns in place
+        self.assertEqual(policy.act_one(obs(3, 0, DOWN, 0, 0, 3, 0)), TURN_RIGHT)  # idle robots turn in place
 
 
 if __name__ == "__main__":

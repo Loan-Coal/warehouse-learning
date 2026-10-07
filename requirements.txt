@@ -1,13 +1,13 @@
-# Light environment (.venv): env/, rl/ and tests/ use the standard library only for now.
-# Add algorithm dependencies here (e.g. numpy). They must also install cleanly in the
-# Isaac venv (C:\venvs\warehouse-isaac, which pins numpy 1.26.0 and torch 2.7.0),
+# Light environment (.venv): env/ uses the standard library only; rl/ needs torch, charts need matplotlib.
+# Add algorithm dependencies here. They must also install cleanly in the Isaac venv
+# (C:\venvs\warehouse-isaac: Isaac Sim 6.1.0.0 brings numpy 2.3.1, torch 2.11.0, matplotlib 3.10.8),
 # because isaac/demo.py runs the same policies.
 #
 # Isaac Sim is deliberately NOT listed: it is a ~20 GB optional install for the viewer
 # only. See README.md, "Isaac Sim viewer".
 
-# Charts for rl.plot / rl.bench (same version the Isaac venv ships).
+# Charts for rl.plot.
 matplotlib==3.10.3
 
-# Neural networks (rl/policies/central_dqn.py). The exact version Isaac ships.
+# Neural networks (rl/policies/ppo.py).
 torch==2.7.0
