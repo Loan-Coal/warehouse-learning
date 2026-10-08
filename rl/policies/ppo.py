@@ -7,8 +7,12 @@ question about the pair (row_i, row_j) and keeps the strongest answer (max) and 
 independently, in parallel, and each robot is trained on its OWN advantage. Why on-policy, why the
 shaping is not the textbook form, and why there are no schedules: LEARNINGS.md.
 
+Each pair also carries a few hand-built relations a function of two separate rows cannot form
+in one layer (graph distance, "j is on my path", "we want the same cell next": rl/features.py).
+
 Ablations: --policy-opt central=0 (the pool holds only robots i's own rays hit, so a robot
-outside every ray is invisible, as in a decentralised policy), bfs=0, shaping=0, eval_greedy=1.
+outside every ray is invisible, as in a decentralised policy), conflict=0 (no pair relations),
+bfs=0, shaping=0, eval_greedy=1.
 The earlier mean-pool PPO (own row + fleet mean) is git tag ppo-mean.
 """
 import json
@@ -20,7 +24,7 @@ from torch import nn
 
 from env.observation import HEADINGS, ROBOT
 from env.warehouse import N_ACTIONS
-from rl.features import Features, target_changed
+from rl.features import PAIR_WIDTH, Features, target_changed
 from rl.nav import legal_actions
 from rl.policy import Policy, flag
 
@@ -66,21 +70,21 @@ class PairNet(nn.Module):
     lone robot, or central=0 with nobody in its rays) pools to zeros.
     """
 
-    def __init__(self, width):
+    def __init__(self, width, pair_width):
         super().__init__()
-        self.phi = nn.Sequential(nn.Linear(2 * width, PAIR), nn.ReLU(),
+        self.phi = nn.Sequential(nn.Linear(2 * width + pair_width, PAIR), nn.ReLU(),
                                  nn.Linear(PAIR, PAIR), nn.ReLU())
         for layer in self.phi:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, 2 ** 0.5)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, x, allow):
+    def forward(self, x, allow, pair):
         n = x.shape[-2]
         mine = x.unsqueeze(-2).expand(*x.shape[:-1], n, x.shape[-1])        # [.., i, j, w] = row_i
         theirs = x.unsqueeze(-3).expand_as(mine)                           # [.., i, j, w] = row_j
         keep = allow.unsqueeze(-1).to(x.dtype)
-        answers = self.phi(torch.cat([mine, theirs], -1)) * keep           # ReLU >= 0: masked -> 0
+        answers = self.phi(torch.cat([mine, theirs, pair], -1)) * keep           # ReLU >= 0: masked -> 0
         mean = answers.sum(-2) / keep.sum(-2).clamp(min=1)
         return torch.cat([x, answers.amax(-2), mean], -1)
 
@@ -88,13 +92,13 @@ class PairNet(nn.Module):
 class Net(nn.Module):
     """Pairwise encoder followed by a two-hidden-layer head. One for the actor, one for the critic."""
 
-    def __init__(self, width, n_out, out_gain):
+    def __init__(self, width, pair_width, n_out, out_gain):
         super().__init__()
-        self.pair = PairNet(width)
+        self.pair = PairNet(width, pair_width)
         self.head = mlp(width + 2 * PAIR, n_out, out_gain)
 
-    def forward(self, x, allow):
-        return self.head(self.pair(x, allow))
+    def forward(self, x, allow, pair):
+        return self.head(self.pair(x, allow, pair))
 
 
 def visible(obs, central):
@@ -138,6 +142,7 @@ class Step(NamedTuple):
     done: torch.Tensor      # the time limit was hit
     ready: torch.Tensor     # the env actually carried the action out
     allow: torch.Tensor     # [robots, robots]: which robots each robot's encoder may look at
+    pair: torch.Tensor      # [robots, robots, PAIR_WIDTH or 0]: the relations Features.pairs built
 
 
 class PPO(Policy):
@@ -146,7 +151,7 @@ class PPO(Policy):
     def __init__(self, spec, seed=0):
         super().__init__(spec, seed)
         self.rng = random.Random(seed)
-        self.use_shaping, self.eval_greedy, self.central = True, False, True
+        self.use_shaping, self.eval_greedy, self.central, self.conflict = True, False, True, True
         self.lr, self.ent = LR, ENT_COEF
         self.typed = set()      # settings given to configure(), which a checkpoint must not undo
         self.inputs = Features(spec.obs_features)
@@ -159,13 +164,14 @@ class PPO(Policy):
     # ------------------------------------------------------------------ setup
 
     def configure(self, bfs=None, shaping=None, eval_greedy=None, lr=None, ent=None, central=None,
-                  **unknown):
+                  conflict=None, **unknown):
         if unknown:
             raise ValueError(f"unknown setting {', '.join(sorted(unknown))}; this policy takes "
-                             f"bfs, shaping, eval_greedy, lr, ent, central")
+                             f"bfs, shaping, eval_greedy, lr, ent, central, conflict")
         # rl/cli.py configures before it loads a checkpoint; load() leaves these alone.
         self.typed |= {key for key, value in (("shaping", shaping), ("eval_greedy", eval_greedy),
-                                              ("lr", lr), ("ent", ent), ("central", central))
+                                              ("lr", lr), ("ent", ent), ("central", central),
+                                              ("conflict", conflict))
                        if value is not None}
         if shaping is not None:
             self.use_shaping = flag(shaping, "shaping")
@@ -176,6 +182,8 @@ class PPO(Policy):
         if central is not None:
             self.central = flag(central, "central")
         rebuild = False
+        if conflict is not None and flag(conflict, "conflict") != self.conflict:
+            self.conflict, rebuild = flag(conflict, "conflict"), True
         if lr is not None and _number(lr, "lr") != self.lr:
             self.lr, rebuild = _number(lr, "lr"), True
         if bfs is not None and flag(bfs, "bfs") != self.inputs.use_bfs:
@@ -188,8 +196,9 @@ class PPO(Policy):
     def _build(self):
         torch.manual_seed(self.seed)
         width = self.inputs.width
-        self.actor = Net(width, N_ACTIONS, 0.01)
-        self.critic = Net(width, 1, 1.0)
+        pair_width = PAIR_WIDTH if self.conflict else 0
+        self.actor = Net(width, pair_width, N_ACTIONS, 0.01)
+        self.critic = Net(width, pair_width, 1, 1.0)
         self.opt = torch.optim.Adam([*self.actor.parameters(), *self.critic.parameters()],
                                     lr=self.lr)
 
@@ -209,33 +218,39 @@ class PPO(Policy):
         """
         x = self.inputs.batch(obs)
         mask = self.masks(obs)
-        allow = self.reach(obs)
+        allow, pair = self.reach(obs), self.pairs(obs)
         with torch.no_grad():
-            logits = self.actor(x, allow).masked_fill(~mask, NEG)
-            value = self.critic(x, allow).squeeze(-1)
+            logits = self.actor(x, allow, pair).masked_fill(~mask, NEG)
+            value = self.critic(x, allow, pair).squeeze(-1)
             if self.training or not self.eval_greedy:
                 actions = torch.distributions.Categorical(logits=logits).sample()
             else:
                 actions = logits.argmax(-1)
             logp = torch.log_softmax(logits, -1).gather(-1, actions.unsqueeze(-1)).squeeze(-1)
-        self.acting = (x, mask, actions, logp, value, allow)
+        self.acting = (x, mask, actions, logp, value, allow, pair)
         return actions.tolist()
 
     def values(self, obs):
         """[envs, robots] critic values for a list of observation lists (no grad)."""
         with torch.no_grad():
-            return self.critic(self.inputs.batch(obs), self.reach(obs)).squeeze(-1)
+            return self.critic(self.inputs.batch(obs), self.reach(obs), self.pairs(obs)).squeeze(-1)
 
     def sample(self, obs):
         """Sampled actions per env, like act_vec, but never records self.acting."""
-        x, mask, allow = self.inputs.batch(obs), self.masks(obs), self.reach(obs)
+        x, mask, allow, pair = self.inputs.batch(obs), self.masks(obs), self.reach(obs), self.pairs(obs)
         with torch.no_grad():
-            logits = self.actor(x, allow).masked_fill(~mask, NEG)
+            logits = self.actor(x, allow, pair).masked_fill(~mask, NEG)
             return torch.distributions.Categorical(logits=logits).sample().tolist()
 
     def reach(self, obs, central=None):
         """[envs, robots, robots] bool: which robots each robot's encoder may look at."""
         return visible(obs, self.central if central is None else central)
+
+    def pairs(self, obs):
+        """[envs, robots, robots, PAIR_WIDTH]; zero-width with conflict=0, so the nets need no branch."""
+        if self.conflict:
+            return self.inputs.pairs(obs)
+        return torch.zeros(len(obs), len(obs[0]), len(obs[0]), 0)
 
     def masks(self, obs):
         """[envs, robots, N_ACTIONS] of bools: which actions the env would actually carry out."""
@@ -248,7 +263,7 @@ class PPO(Policy):
         self.update_vec([obs], [actions], [rewards], [next_obs], [done])
 
     def update_vec(self, obs, actions, rewards, next_obs, dones):
-        x, mask, acted, logp, value, allow = self.acting
+        x, mask, acted, logp, value, allow, pair = self.acting
         if x.shape[0] != len(obs):
             raise RuntimeError(f"update_vec got {len(obs)} envs but act_vec ran on {x.shape[0]}")
         # V(next_obs) is only computed here where act_vec will not score it next: at an episode
@@ -260,12 +275,13 @@ class PPO(Policy):
         if rows:
             with torch.no_grad():
                 ended = [next_obs[i] for i in rows]
-                after[rows] = self.critic(self.inputs.batch(ended), self.reach(ended)).squeeze(-1)
+                after[rows] = self.critic(self.inputs.batch(ended), self.reach(ended),
+                                          self.pairs(ended)).squeeze(-1)
         self.rollout.append(Step(
             x, mask, acted, logp, value, after,
             torch.tensor([self.learning_rewards(*step) for step in zip(obs, rewards, next_obs)]),
             torch.tensor([float(d) for d in dones]),
-            torch.tensor([[float(o.ready) for o in one] for one in obs]), allow))
+            torch.tensor([[float(o.ready) for o in one] for one in obs]), allow, pair))
         self.steps += len(obs)
         if len(self.rollout) >= ROLLOUT:
             self._learn()
@@ -286,7 +302,7 @@ class PPO(Policy):
         return out
 
     def _learn(self):
-        x, mask, acted, logp, value, after, reward, done, ready, allow = (
+        x, mask, acted, logp, value, after, reward, done, ready, allow, pair = (
             torch.stack(part) for part in zip(*self.rollout))
         # Fill in the bootstraps update_vec skipped: where an env did not end, it is t+1's value.
         carried = done[:-1].unsqueeze(-1).bool()
@@ -296,7 +312,7 @@ class PPO(Policy):
 
         # Keep the robot axis: the encoder pools over one env's robots, so a minibatch is a
         # set of whole fleets, never of loose robots.
-        flat = [t.flatten(0, 1) for t in (x, mask, acted, logp, advantage, returns, ready, allow)]
+        flat = [t.flatten(0, 1) for t in (x, mask, acted, logp, advantage, returns, ready, allow, pair)]
         groups = flat[0].shape[0]
         order = list(range(groups))
         size = max(1, groups // MINIBATCHES)
@@ -326,8 +342,8 @@ class PPO(Policy):
         return advantage
 
     def _step(self, batch):
-        x, mask, acted, old_logp, advantage, returns, live, allow = batch
-        logits = self.actor(x, allow).masked_fill(~mask, NEG)
+        x, mask, acted, old_logp, advantage, returns, live, allow, pair = batch
+        logits = self.actor(x, allow, pair).masked_fill(~mask, NEG)
         dist = torch.distributions.Categorical(logits=logits)
         ratio = (dist.log_prob(acted) - old_logp).exp()
 
@@ -344,7 +360,7 @@ class PPO(Policy):
         # The value loss keeps every row, including the discarded ones: time still passed and a
         # reward still arrived, so the critic should predict that return. Only the POLICY has
         # nothing to learn from an action the env threw away.
-        value_loss = ((self.critic(x, allow).squeeze(-1) - returns) ** 2).mean()
+        value_loss = ((self.critic(x, allow, pair).squeeze(-1) - returns) ** 2).mean()
         loss = policy_loss + VF_COEF * value_loss - self.ent * entropy
         self.opt.zero_grad()
         loss.backward()
@@ -370,7 +386,7 @@ class PPO(Policy):
         torch.save(self.opt.state_dict(), folder / "opt.pt")
         state = {"bfs": self.inputs.use_bfs, "shaping": self.use_shaping,
                  "eval_greedy": self.eval_greedy, "lr": self.lr, "ent": self.ent,
-                 "central": self.central, "encoder": "pair",
+                 "central": self.central, "conflict": self.conflict, "encoder": "pair",
                  "steps": self.steps, "updates": self.updates, **self.log}
         (folder / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -378,7 +394,7 @@ class PPO(Policy):
         """The weights, the optimiser and every setting configure() was not given.
 
         A typed setting wins over the saved one (--checkpoint X --policy-opt eval_greedy=1 must
-        evaluate with argmax), except bfs: the checkpoint's decides how wide the weights are.
+        evaluate with argmax), except bfs and conflict: the checkpoint's decide how wide the weights are.
         """
         state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
         if state.get("encoder") != "pair":
@@ -389,6 +405,12 @@ class PPO(Policy):
         for key, attribute in saved.items():
             if key not in self.typed:
                 setattr(self, attribute, state[key])
+        conflict = state.get("conflict", False)     # old checkpoints were trained without pair features
+        if conflict != self.conflict:
+            if "conflict" in self.typed:
+                raise ValueError(f"this checkpoint was trained with conflict={conflict}; its weights "
+                                 f"do not fit conflict={self.conflict}")
+            self.conflict = conflict
         if state["bfs"] != self.inputs.use_bfs:
             # The checkpoint's own setting wins: it decides how wide the saved weights are.
             self.inputs = Features(self.spec.obs_features, use_bfs=state["bfs"])

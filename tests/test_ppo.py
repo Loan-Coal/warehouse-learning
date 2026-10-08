@@ -25,6 +25,7 @@ import rl.policies.ppo as mod
 from env.layout import maze_layout
 from env.observation import HEADINGS, RIGHT, ROBOT, obs_type
 from env.warehouse import N_ACTIONS, Warehouse
+from rl.features import PAIR_WIDTH
 from rl.policies.ppo import PPO, visible
 from rl.vecenv import VecWarehouse
 
@@ -107,7 +108,7 @@ class TestCentralised(unittest.TestCase):
     def run_net(self, obs, central):
         x = self.policy.inputs.batch([obs])
         with torch.no_grad():
-            return self.policy.actor(x, self.policy.reach([obs], central))
+            return self.policy.actor(x, self.policy.reach([obs], central), self.policy.pairs([obs]))
 
     def test_a_robot_outside_every_ray_changes_the_decision_only_when_central(self):
         near = fleet((2, 2, RIGHT), (5, 2, RIGHT), (3, 3, RIGHT))
@@ -123,29 +124,33 @@ class TestCentralised(unittest.TestCase):
         with torch.no_grad():
             x = self.policy.inputs.batch([obs])
             allow = self.policy.reach([obs], True)
-            base = self.policy.actor(x, allow)
-            moved = self.policy.actor(x[:, order], allow[:, order][:, :, order])
-            value = self.policy.critic(x, allow)
-            value_moved = self.policy.critic(x[:, order], allow[:, order][:, :, order])
+            pair = self.policy.pairs([obs])
+            base = self.policy.actor(x, allow, pair)
+            moved = self.policy.actor(x[:, order], allow[:, order][:, :, order],
+                                      pair[:, order][:, :, order])
+            value = self.policy.critic(x, allow, pair)
+            value_moved = self.policy.critic(x[:, order], allow[:, order][:, :, order],
+                                             pair[:, order][:, :, order])
         torch.testing.assert_close(moved, base[:, order])
         torch.testing.assert_close(value_moved, value[:, order])
 
     def test_a_lone_robot_gets_finite_logits_and_value(self):
         obs = fleet((2, 2, RIGHT))
         x = self.policy.inputs.batch([obs])
-        allow = self.policy.reach([obs], True)
+        allow, pair = self.policy.reach([obs], True), self.policy.pairs([obs])
         self.assertEqual(tuple(allow.shape), (1, 1, 1))
         with torch.no_grad():
-            self.assertTrue(torch.isfinite(self.policy.actor(x, allow)).all())
-            self.assertTrue(torch.isfinite(self.policy.critic(x, allow)).all())
+            self.assertTrue(torch.isfinite(self.policy.actor(x, allow, pair)).all())
+            self.assertTrue(torch.isfinite(self.policy.critic(x, allow, pair)).all())
 
     def test_envs_never_mix(self):
         first, second = fleet((2, 2, 0), (5, 2, 1)), fleet((1, 1, 3), (3, 3, 2))
         with torch.no_grad():
             both = self.policy.actor(self.policy.inputs.batch([first, second]),
-                                     self.policy.reach([first, second], True))
+                                     self.policy.reach([first, second], True),
+                                     self.policy.pairs([first, second]))
             alone = self.policy.actor(self.policy.inputs.batch([first]),
-                                      self.policy.reach([first], True))
+                                      self.policy.reach([first], True), self.policy.pairs([first]))
         torch.testing.assert_close(both[:1], alone)
 
 
@@ -178,7 +183,8 @@ class TestMask(unittest.TestCase):
         policy.reset()
         mask = policy.masks([obs])
         with torch.no_grad():
-            logits = policy.actor(policy.inputs.batch([obs]), policy.reach([obs])).masked_fill(~mask, mod.NEG)
+            logits = policy.actor(policy.inputs.batch([obs]), policy.reach([obs]),
+                                  policy.pairs([obs])).masked_fill(~mask, mod.NEG)
             dist = torch.distributions.Categorical(logits=logits)
         self.assertTrue(torch.all(dist.probs[~mask] == 0.0), "an illegal action kept probability")
         self.assertTrue(torch.isfinite(dist.entropy()).all())
@@ -224,7 +230,8 @@ class TestTruncationBootstrap(unittest.TestCase):
 
         def recording(obs, actions, rewards, next_obs, dones):
             with torch.no_grad():
-                expected.append(policy.critic(policy.inputs.batch(next_obs), policy.reach(next_obs)).squeeze(-1))
+                expected.append(policy.critic(policy.inputs.batch(next_obs), policy.reach(next_obs),
+                                              policy.pairs(next_obs)).squeeze(-1))
             update_vec(obs, actions, rewards, next_obs, dones)
 
         def spy(reward, value, after, done):
@@ -270,7 +277,7 @@ class TestUpdate(unittest.TestCase):
             acted[0, row] = next(a for a in range(N_ACTIONS) if mask[0, row, a])
         args = [x, mask, acted, torch.zeros(1, ROBOTS), torch.ones(1, ROBOTS),
                 torch.full((1, ROBOTS), 3.0), torch.zeros(1, ROBOTS),     # ready all zero
-                policy.reach([obs])]
+                policy.reach([obs]), policy.pairs([obs])]
         policy._step([t.clone() for t in args])
         self.assertTrue(math.isfinite(policy.log["loss"]))
         # With no live row the policy term and the entropy are both zero by masked_mean, so the
@@ -314,10 +321,10 @@ class TestStoredAndRecomputed(unittest.TestCase):
         play(policy, vec, STEPS + 5)                    # spans an episode boundary and a map change
         self.assertGreater(len(policy.rollout), STEPS)
 
-        x, mask, acted, logp, allow = [torch.stack([getattr(s, f) for s in policy.rollout])
-                                       for f in ("x", "mask", "acted", "logp", "allow")]
+        x, mask, acted, logp, allow, pair = [torch.stack([getattr(s, f) for s in policy.rollout])
+                                             for f in ("x", "mask", "acted", "logp", "allow", "pair")]
         with torch.no_grad():
-            logits = policy.actor(x.flatten(0, 1), allow.flatten(0, 1)).masked_fill(
+            logits = policy.actor(x.flatten(0, 1), allow.flatten(0, 1), pair.flatten(0, 1)).masked_fill(
                 ~mask.flatten(0, 1), mod.NEG)
             again = torch.distributions.Categorical(logits=logits).log_prob(acted.flatten(0, 1))
         ratio = (again - logp.flatten(0, 1)).exp()
@@ -396,6 +403,50 @@ class TestTransfer(unittest.TestCase):
             wide.load(folder)
             self.assertEqual((wide.inputs.width, wide.inputs.use_bfs),
                              (narrow.inputs.width, False))
+
+
+class TestConflictFeatures(unittest.TestCase):
+    def test_conflict_features_reach_the_actor(self):
+        env = maze_env()
+        policy = PPO(env.spec, seed=0)
+        obs = env.reset(0)
+        policy.reset()
+        x, allow, pair = policy.inputs.batch([obs]), policy.reach([obs]), policy.pairs([obs])
+        self.assertEqual(tuple(pair.shape), (1, ROBOTS, ROBOTS, PAIR_WIDTH))
+        self.assertGreater(pair.abs().sum().item(), 0)
+        with torch.no_grad():
+            self.assertFalse(torch.equal(policy.actor(x, allow, pair),
+                                         policy.actor(x, allow, torch.zeros_like(pair))))
+        policy.configure(conflict="0")
+        self.assertEqual(policy.pairs([obs]).shape[-1], 0)
+        with torch.no_grad():
+            self.assertEqual(tuple(policy.actor(x, allow, policy.pairs([obs])).shape),
+                             (1, ROBOTS, N_ACTIONS))
+
+    def test_old_checkpoint_without_conflict_key_loads_as_conflict_off(self):
+        env = maze_env()
+        old = PPO(env.spec, seed=0)
+        old.configure(conflict="0")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            old.save(folder)
+            state = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+            state.pop("conflict")
+            (folder / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            fresh = PPO(env.spec, seed=0)
+            fresh.load(folder)
+            self.assertIs(fresh.conflict, False)
+            self.assertEqual(fresh.actor.pair.phi[0].in_features, 2 * fresh.inputs.width)
+
+    def test_a_typed_conflict_that_does_not_fit_the_checkpoint_is_refused(self):
+        env = maze_env()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            PPO(env.spec, seed=0).save(folder)
+            typed = PPO(env.spec, seed=0)
+            typed.configure(conflict="0")
+            with self.assertRaisesRegex(ValueError, "trained with conflict=True"):
+                typed.load(folder)
 
 
 class TestEncoderCheckpoint(unittest.TestCase):

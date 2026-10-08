@@ -11,12 +11,14 @@ import torch
 
 from env.observation import HEADINGS, obs_type
 from env.warehouse import HUMAN, ROBOT, VALUE_DECAY_STEPS, VALUE_FLOOR
-from rl.nav import UNREACHABLE, distance_field
+from rl.nav import UNREACHABLE, distance_field, distance_from
 
 # VIEW mirrors Warehouse(view_range=5), which EnvSpec does not carry: another value would push
 # dist / VIEW quietly past 1.0.
 VIEW, RAY_TYPES = 5, HUMAN + 1          # ray range, and the ray types (0 = nothing .. 6 = human)
 PRIORITY_MAX = 3                        # env jobs draw a priority in 1..3 (env/warehouse.py)
+
+PAIR_WIDTH = 9      # pair_row() below; the pairwise encoder's extra input per (i, j)
 
 torch.set_num_threads(min(8, os.cpu_count() or 1))      # measured best; see LEARNINGS.md
 
@@ -50,6 +52,49 @@ class Features:
         """[envs, robots, width], the shape the networks want. Dominated by the Python loop in row()."""
         return torch.tensor([[self.row(o) for o in one] for one in obs_per_env],
                             dtype=torch.float32)
+
+    def pairs(self, obs_per_env):
+        """[envs, robots, robots, PAIR_WIDTH]: what robot j means to robot i, per pair. The
+        diagonal is zeros. The pairwise encoder (rl/policies/ppo.py) reads [row_i, row_j,
+        pair_ij]; these are the relations a function of two separate rows cannot form in one
+        layer: graph distance, "j is on my path", "we want the same cell next"."""
+        out = []
+        for one in obs_per_env:
+            n = len(one)
+            rows = [[[0.0] * PAIR_WIDTH for _ in range(n)] for _ in range(n)]
+            nxt = [self.best_next(o) for o in one]
+            for i, oi in enumerate(one):
+                for j, oj in enumerate(one):
+                    if i != j:
+                        rows[i][j] = self.pair_row(oi, oj, nxt[i], nxt[j])
+            out.append(rows)
+        return torch.tensor(out, dtype=torch.float32)
+
+    def best_next(self, o):
+        """The neighbour cell that steps closer to the target (first in HEADINGS order), or None."""
+        if not o.has_task:
+            return None
+        field = distance_field(self.grid, (o.target_x, o.target_y))
+        here = field.at(o.x, o.y)
+        if here == UNREACHABLE or here == 0:
+            return None
+        for dx, dy in HEADINGS:
+            if field.at(o.x + dx, o.y + dy) == here - 1:
+                return (o.x + dx, o.y + dy)
+        return None
+
+    def pair_row(self, oi, oj, next_i, next_j):
+        d = distance_from(self.grid, (oj.x, oj.y)).at(oi.x, oi.y)
+        dist = 1.0 if d == UNREACHABLE else min(d / (self.w + self.h), 1.0)
+        on_path = 0.0
+        if oi.has_task and d != UNREACHABLE:
+            field = distance_field(self.grid, (oi.target_x, oi.target_y))
+            here, there = field.at(oi.x, oi.y), field.at(oj.x, oj.y)
+            on_path = float(here != UNREACHABLE and there != UNREACHABLE and there + d == here)
+        same_next = float(next_i is not None and next_i == next_j)
+        toward_me = float(next_j == (oi.x, oi.y))
+        toward_them = float(next_i == (oj.x, oj.y))
+        return [dist, on_path, same_next, toward_me, toward_them] + one_hot((oj.heading - oi.heading) % 4, 4)
 
     def row(self, o):
         """One robot's input. Every feature here is one that some action can change.

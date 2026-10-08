@@ -11,7 +11,7 @@ from rl.policy import independent, shared  # noqa: F401  (independent: for your 
 
 POLICIES = {
     "greedy": shared(GreedyRule),
-    "ppo": PPO,                             # centralised: one agent, a pairwise encoder over the whole fleet
+    "ppo": PPO,                             # centralised: one agent, a pairwise encoder over the whole fleet, pair conflict features (--policy-opt conflict=0 to switch off)
     "planner": Planner,                     # benchmark: non-learning space-time planner, three information levels (README)
     "template": shared(TemplateQLearner),   # the template as-is: try the whole pipeline before writing code
 }
