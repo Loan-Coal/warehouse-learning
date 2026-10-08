@@ -61,6 +61,15 @@ class TestPlan(unittest.TestCase):
     def test_an_unreachable_target_gives_none(self):
         self.assertIsNone(search((0, 0), RIGHT, target=(9, 9)))
 
+    def test_a_hold_does_not_erase_a_reservation_made_first(self):
+        table = Reservations()
+        table.book(0, (2, 0), 5, 5)
+        table.book(1, (2, 0), 3, 8)
+        self.assertEqual(table.cells[((2, 0), 5)], 0)
+        self.assertEqual(table.cells[((2, 0), 4)], 1)
+        table.release(1)
+        self.assertEqual(table.cells[((2, 0), 5)], 0)
+
     def test_release_drops_every_entry_of_a_robot(self):
         table = Reservations()
         table.book(1, (2, 0), 0, 3)

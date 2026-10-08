@@ -39,10 +39,11 @@ class Reservations:
         return self.edges.get((b, a, t), robot) != robot
 
     def book(self, robot, cell, t0, t1):
-        """Hold `cell` from tick t0 to t1 inclusive."""
+        """Hold `cell` from tick t0 to t1 inclusive. A tick another robot already holds stays
+        theirs: a hold (a robot that finished or failed) must not erase a path planned first."""
         for t in range(t0, t1 + 1):
-            self.cells[(cell, t)] = robot
-            self.owned.setdefault(robot, []).append(("c", (cell, t)))
+            if self.cells.setdefault((cell, t), robot) == robot:
+                self.owned.setdefault(robot, []).append(("c", (cell, t)))
 
     def book_move(self, robot, a, b, t):
         self.edges[(a, b, t)] = robot
