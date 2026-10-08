@@ -16,6 +16,7 @@ def run_episode(env, policy, seed, train, on_step=None, layout=None):
     obs = env.reset(seed, layout)
     policy.spec = env.spec      # the map may have changed
     policy.reset()
+    policy.see_env(env)
     metrics = EpisodeMetrics()
     metrics.reset(env)
     returns = [0.0] * env.n_robots

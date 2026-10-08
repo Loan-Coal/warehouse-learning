@@ -68,6 +68,19 @@ def distance_field(grid, cell):
     return _FIELDS[key]
 
 
+def distance_from(grid, cell):
+    """Shortest walkable distance to `cell` ITSELF from anywhere (a robot's cell, not a
+    shelf): the pair features need robot-to-robot distances. Cached like distance_field.
+    """
+    key = (grid, cell, "self")
+    if key not in _FIELDS:
+        if len(_FIELDS) >= FIELD_CACHE:
+            _FIELDS.clear()
+        goals = [cell] if is_walkable(grid, *cell) else []
+        _FIELDS[key] = _build(grid, goals)
+    return _FIELDS[key]
+
+
 def _build(grid, goals):
     width, height = len(grid[0]), len(grid)
     steps = array("i", [UNREACHABLE]) * (width * height)

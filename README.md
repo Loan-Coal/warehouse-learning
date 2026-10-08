@@ -42,7 +42,7 @@ checkpoints are refused instead of silently misbehaving. A change to `env/` that
 
 ## Setup (Windows, PowerShell, from the repo root)
 
-Needs Python **3.11**: `winget install -e --id Python.Python.3.11`
+Needs Python **3.11** for the light venv (3.12 for the Isaac venv): `winget install -e --id Python.Python.3.11`
 
 ```powershell
 py -3.11 -m venv .venv
@@ -307,7 +307,7 @@ own files reach ~200 characters inside the venv, and on Windows a long prefix ma
 filename or extension is too long"), even with long paths enabled.
 
 ```powershell
-py -3.11 -m venv C:\venvs\warehouse-isaac
+py -3.12 -m venv C:\venvs\warehouse-isaac
 C:\venvs\warehouse-isaac\Scripts\python.exe -m pip install --upgrade pip
 C:\venvs\warehouse-isaac\Scripts\python.exe -m pip install "isaacsim[all,extscache]==6.1.0.0" --extra-index-url https://pypi.nvidia.com
 C:\venvs\warehouse-isaac\Scripts\activate.bat      # cmd;  PowerShell: C:\venvs\warehouse-isaac\Scripts\Activate.ps1

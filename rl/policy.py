@@ -10,7 +10,8 @@ Two shapes, pick one:
 
 Every constructor takes (spec, seed): spec is an env.warehouse.EnvSpec. The runner sets
 `training` to True while training and False in evaluation and in the Isaac demo; update()
-is only called while training.
+is only called while training. see_env(env) is called once per episode (a no-op except for
+the two policies that read the env: planner and search).
 
 OBS lists what the robots observe (feature groups from env/observation.py); the env builds
 exactly that for your algorithm, and the checkpoint remembers it. `self.spec` is refreshed
@@ -45,6 +46,16 @@ class Policy:
 
     def act(self, obs: list[Obs]) -> list[int]:
         raise NotImplementedError
+
+    def see_env(self, env) -> None:
+        """The loop shows the policy the live env once per episode, right after reset().
+
+        A no-op for every colleague algorithm: a policy sees only observations (README,
+        "Model access rule"). Only two registered policies override it: `planner` (the
+        benchmark, which reads env.humans at its cheating levels) and `search` (which
+        copies the env and re-seeds the copy). Keep the reference; the env object stays the
+        same for the whole episode, so reading it at act() time is current.
+        """
 
     def update(self, obs: list[Obs], actions: list[int], rewards: list[float],
                next_obs: list[Obs], done: bool) -> None:

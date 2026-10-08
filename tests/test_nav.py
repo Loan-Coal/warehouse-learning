@@ -15,7 +15,7 @@ from env.layout import DEFAULT_MAP, access_cells, cells_of, is_walkable, maze_la
 from env.warehouse import N_ACTIONS, TURN_LEFT, TURN_RIGHT, Warehouse
 from rl import nav
 from rl.features import Features
-from rl.nav import UNREACHABLE, distance_field, legal_actions
+from rl.nav import UNREACHABLE, distance_field, distance_from, legal_actions
 
 ROBOTS, STEPS = 4, 60
 FACTORS = dict(mixed_crates=True, mixed_robots=True, priority=True, humans=2)
@@ -137,6 +137,17 @@ class TestCache(unittest.TestCase):
         finally:
             nav.FIELD_CACHE = kept
             nav._FIELDS.clear()
+
+    def test_distance_from_measures_to_the_cell_itself(self):
+        grid = parse(DEFAULT_MAP)
+        field = distance_from(grid, (0, 0))
+        self.assertEqual(field.at(0, 0), 0)
+        self.assertEqual(field.at(1, 0), 1)
+        shelf = cells_of(grid, "S")[0]
+        field = distance_from(grid, shelf)
+        self.assertTrue(all(field.at(x, y) == UNREACHABLE
+                            for y in range(len(grid)) for x in range(len(grid[0]))))
+
 
 if __name__ == "__main__":
     unittest.main()

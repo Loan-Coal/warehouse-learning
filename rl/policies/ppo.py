@@ -221,6 +221,18 @@ class PPO(Policy):
         self.acting = (x, mask, actions, logp, value, allow)
         return actions.tolist()
 
+    def values(self, obs):
+        """[envs, robots] critic values for a list of observation lists (no grad)."""
+        with torch.no_grad():
+            return self.critic(self.inputs.batch(obs), self.reach(obs)).squeeze(-1)
+
+    def sample(self, obs):
+        """Sampled actions per env, like act_vec, but never records self.acting."""
+        x, mask, allow = self.inputs.batch(obs), self.masks(obs), self.reach(obs)
+        with torch.no_grad():
+            logits = self.actor(x, allow).masked_fill(~mask, NEG)
+            return torch.distributions.Categorical(logits=logits).sample().tolist()
+
     def reach(self, obs, central=None):
         """[envs, robots, robots] bool: which robots each robot's encoder may look at."""
         return visible(obs, self.central if central is None else central)

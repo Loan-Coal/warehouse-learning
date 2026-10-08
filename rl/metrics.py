@@ -9,6 +9,8 @@ A job is measured in the robot's OWN actions against the fewest it could have us
 half-speed robot is judged on what it did, not on its speed. Jobs still running when the episode
 ends are left out, which drops the longest ones: read job_ratio as slightly optimistic.
 
+The facing fields and state graph are also the planner's heuristic (rl/policies/planner.py).
+
 Rulers, not rewards. "Crowded" is a proxy for a deliberate yield, so putting any of this in a
 reward would teach the fleet to stand near each other.
 """
@@ -140,41 +142,41 @@ def job_optimum(grid, state, pickup, dropoff):
     to the pickup is searched from the start until every pickup-facing state is found.
     Returns None if the job cannot be done on this map.
     """
-    graph = _graph(grid)
-    goals = _facing_states(grid, pickup)
-    to_drop = _facing_field(grid, dropoff)
-    reached = _search(graph, [_index(grid, state)], stop_when=goals)
+    graph = state_graph(grid)
+    goals = facing_states(grid, pickup)
+    to_drop = facing_field(grid, dropoff)
+    reached = _search(graph, [state_index(grid, state)], stop_when=goals)
     legs = [reached[g] + to_drop[g] for g in goals if reached[g] >= 0 and to_drop[g] >= 0]
     return min(legs) + 2 if legs else None      # + the pickup and the dropoff themselves
 
 
-def _facing_field(grid, cell):
+def facing_field(grid, cell):
     key = (grid, cell)
     if key not in _FACING:
         if len(_FACING) >= FIELD_CACHE:
             _FACING.clear()
         # Stored as a C int array: a quarter the memory of a list of Python ints.
-        _FACING[key] = array("i", _search(_graph(grid), _facing_states(grid, cell)))
+        _FACING[key] = array("i", _search(state_graph(grid), facing_states(grid, cell)))
     return _FACING[key]
 
 
-def _index(grid, state):
+def state_index(grid, state):
     """(pos, heading) -> one int, so a search runs on flat lists rather than tuples in dicts."""
     (x, y), heading = state
     return (y * len(grid[0]) + x) * 4 + heading
 
 
-def _facing_states(grid, cell):
+def facing_states(grid, cell):
     """State indices from which a robot faces `cell`."""
     out = []
     for heading, (dx, dy) in enumerate(HEADINGS):
         pos = (cell[0] - dx, cell[1] - dy)
         if is_walkable(grid, *pos):
-            out.append(_index(grid, (pos, heading)))
+            out.append(state_index(grid, (pos, heading)))
     return out
 
 
-def _graph(grid):
+def state_graph(grid):
     """Each state's neighbours: the two turns, and forward / backward where walkable.
 
     Built once per map; one map serves a whole round of --envs episodes.
@@ -190,13 +192,13 @@ def _graph(grid):
                 if not is_walkable(grid, x, y):
                     continue
                 for heading, (dx, dy) in enumerate(HEADINGS):
-                    out = [_index(grid, ((x, y), (heading + 1) % 4)),
-                           _index(grid, ((x, y), (heading - 1) % 4))]
+                    out = [state_index(grid, ((x, y), (heading + 1) % 4)),
+                           state_index(grid, ((x, y), (heading - 1) % 4))]
                     for sign in (1, -1):
                         pos = (x + sign * dx, y + sign * dy)
                         if is_walkable(grid, *pos):
-                            out.append(_index(grid, (pos, heading)))
-                    graph[_index(grid, ((x, y), heading))] = tuple(out)
+                            out.append(state_index(grid, (pos, heading)))
+                    graph[state_index(grid, ((x, y), heading))] = tuple(out)
         _GRAPHS[grid] = graph
     return _GRAPHS[grid]
 

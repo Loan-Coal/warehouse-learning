@@ -104,6 +104,24 @@ class TestPlumbing(unittest.TestCase):
         env = small_env()
         self.assertEqual(run_episode(env, Central(env.spec), 0, train=False)["invalid"], 0)
 
+    def test_see_env_is_called_once_per_episode_after_reset(self):
+        class Watcher(Policy):
+            def __init__(self, spec, seed=0):
+                super().__init__(spec, seed)
+                self.seen = []
+
+            def act(self, obs):
+                return [TURN_RIGHT] * len(obs)
+
+            def see_env(self, env):
+                self.seen.append((env, env.t))
+
+        env = small_env()
+        policy = Watcher(env.spec)
+        run_episode(env, policy, 0, train=False)
+        run_episode(env, policy, 1, train=False)
+        self.assertEqual(policy.seen, [(env, 0), (env, 0)])
+
     def test_on_step_can_stop_the_episode(self):
         env = small_env()
         calls = []
