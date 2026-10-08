@@ -115,6 +115,19 @@ python -m rl.bench planner --policy-opt info=state --scenarios big --episodes 10
 python -m rl.bench planner --policy-opt info=future --scenarios big --episodes 100 --seed 90000 --new-map --out results/ladder_future
 ```
 
+### Search: PPO plus lookahead
+
+`search` wraps a PPO checkpoint and, whenever a robot or human is within two cells, tries each legal action of each
+robot in turn in re-seeded copies of the env, rolling the fleet forward `depth` steps with the PPO policy and
+bootstrapping with its critic; it keeps the action with the best average return over `k` rollouts, else the PPO
+sample. Robots are decided one after another, so the second one sees the first one's real choice. Evaluation only:
+
+```powershell
+python -m rl.bench search --policy-opt prior=checkpoints/long_s20000 --scenarios big --episodes 100 --seed 90000 --new-map --out results/search
+```
+
+Settings: `prior`, `k` (default 4), `depth` (default 6), `when=near|always`.
+
 ## Writing an algorithm (guide for the algorithm team)
 
 You only ever touch two places: your own file in `rl/policies/`, and one import plus one line in
