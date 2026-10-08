@@ -100,6 +100,21 @@ python -m rl.bench greedy --scenarios hard big --episodes 100 --seed 90000 --new
 
 How many episodes to report and which metric to lead with: LEARNINGS.md, "Measuring".
 
+### Planner: the ceiling
+
+`planner` is a non-learning space-time planner (`rl/policies/planner.py`): each robot books the cells it will
+occupy tick by tick, shortest job first, and everyone re-plans every step, so robots never block each other by
+construction. `--policy-opt info=` sets what it may know: `obs` (what PPO sees: every robot's observation, humans only
+through rays), `state` (every human's position), `future` (a copy of the env with the real random stream: it sees where
+humans will step). Jobs and humans are random, so no optimum exists; the three levels bound what information is worth
+versus what learning is worth.
+
+```powershell
+python -m rl.bench greedy planner =checkpoints/long_s20000 --scenarios big --episodes 100 --seed 90000 --new-map --out results/ladder_obs
+python -m rl.bench planner --policy-opt info=state --scenarios big --episodes 100 --seed 90000 --new-map --out results/ladder_state
+python -m rl.bench planner --policy-opt info=future --scenarios big --episodes 100 --seed 90000 --new-map --out results/ladder_future
+```
+
 ## Writing an algorithm (guide for the algorithm team)
 
 You only ever touch two places: your own file in `rl/policies/`, and one import plus one line in
@@ -189,6 +204,13 @@ POLICIES = {
     "myalgo": shared(MyAlgo),          # <- yours
 }
 ```
+
+### Model access rule
+
+A colleague algorithm sees only the list of observations. The loop also calls `see_env(env)` once per episode;
+colleague code must not override it. Two registered policies do: `planner` (a benchmark, allowed to cheat as
+documented) and `search` (may copy the env with `rl.model.clone` but must re-seed the copy, so it samples futures
+rather than reading the true one).
 
 ### 6. Test it
 
