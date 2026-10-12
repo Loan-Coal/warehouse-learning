@@ -2,3 +2,5 @@
 .venv-isaac/
 __pycache__/
 *.pyc
+checkpoints/
+results/

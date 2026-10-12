@@ -1,0 +1,223 @@
+"""The interface every algorithm implements. Start from rl/policies/_template.py.
+
+Two shapes, pick one:
+
+    RobotPolicy  decides for ONE robot:  act_one(obs) -> int
+                 register it wrapped: shared(MyAlgo) = one set of weights for every robot,
+                                      independent(MyAlgo) = one copy per robot.
+    Policy       decides for ALL robots at once: act(obs_list) -> list[int]
+                 for centralized controllers and CTDE (e.g. MAPPO, QMIX); register the class itself.
+
+Every constructor takes (spec, seed): spec is an env.warehouse.EnvSpec. The runner sets
+`training` to True while training and False in evaluation and in the Isaac demo; update()
+is only called while training. see_env(env) is called once per episode (a no-op except for
+the two policies that read the env: planner and search).
+
+OBS lists what the robots observe (feature groups from env/observation.py); the env builds
+exactly that for your algorithm, and the checkpoint remembers it. `self.spec` is refreshed
+before every episode, so with --new-map spec.grid is always the current map.
+"""
+from pathlib import Path
+
+from env.observation import DEFAULT_OBS
+from env.warehouse import EnvSpec
+
+def flag(value, name):
+    """A --policy-opt value as a bool: they arrive as strings, so every policy needs this."""
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} wants 0 or 1, got '{value}'")
+
+
+Obs = tuple     # a namedtuple whose fields are the OBS groups' fields, e.g. obs.x, obs.front_t
+
+
+class Policy:
+    """Decides for all robots at once. Subclass it for a centralized controller."""
+
+    OBS = DEFAULT_OBS
+
+    def __init__(self, spec: EnvSpec, seed: int = 0):
+        self.spec, self.seed = spec, seed
+        self.training = False
+
+    def act(self, obs: list[Obs]) -> list[int]:
+        raise NotImplementedError
+
+    def see_env(self, env) -> None:
+        """The loop shows the policy the live env once per episode, right after reset().
+
+        A no-op for every colleague algorithm: a policy sees only observations (README,
+        "Model access rule"). Only two registered policies override it: `planner` (the
+        benchmark, which reads env.humans at its cheating levels) and `search` (which
+        copies the env and re-seeds the copy). Keep the reference; the env object stays the
+        same for the whole episode, so reading it at act() time is current.
+        """
+
+    def update(self, obs: list[Obs], actions: list[int], rewards: list[float],
+               next_obs: list[Obs], done: bool) -> None:
+        """Called after every step while training. done is a time limit, never a terminal state."""
+
+    def reset(self) -> None:
+        """Called at the start of every episode."""
+
+    def act_vec(self, obs: list[list[Obs]]) -> list[list[int]]:
+        """Actions for several envs at once: one observation list per env, in the same order.
+
+        Optional. The default plays them one env at a time, which is correct but gives up the
+        only reason rl/vecloop.py exists -- override it to put every robot of every env through
+        a single forward pass. Nothing else about your policy has to change.
+        """
+        return [self.act(one) for one in obs]
+
+    def update_vec(self, obs, actions, rewards, next_obs, dones) -> None:
+        """update() for several envs at once. Same arguments, each a list indexed by env.
+
+        next_obs is the real successor of each transition, so in a slot whose episode just ran
+        out of time it is the observation that episode ENDED on, not the restarted one.
+        """
+        for step in zip(obs, actions, rewards, next_obs, dones):
+            self.update(*step)
+
+    def configure(self, **opts) -> None:
+        """Apply --policy-opt settings. Called once, before any checkpoint is loaded."""
+        if opts:
+            raise ValueError(f"policy takes no --policy-opt: {', '.join(sorted(opts))}")
+
+    def stats(self) -> dict:
+        """Extra scalars for train_log.csv (epsilon, loss...). Unknown keys are ignored."""
+        return {}
+
+    def save(self, folder: Path) -> None:
+        """Write plain files (JSON, torch state_dict) into folder, which already exists."""
+
+    def load(self, folder: Path) -> None:
+        """Read back what save() wrote."""
+
+
+class RobotPolicy:
+    """Decides for one robot. Same methods as Policy, but for a single robot's data."""
+
+    OBS = DEFAULT_OBS
+
+    def __init__(self, spec: EnvSpec, seed: int = 0):
+        self.spec, self.seed = spec, seed
+        self.training = False
+
+    def act_one(self, obs: Obs) -> int:
+        raise NotImplementedError
+
+    def update_one(self, obs: Obs, action: int, reward: float, next_obs: Obs, done: bool) -> None:
+        pass
+
+    def reset(self) -> None:
+        pass
+
+    def configure(self, **opts) -> None:
+        if opts:
+            raise ValueError(f"policy takes no --policy-opt: {', '.join(sorted(opts))}")
+
+    def stats(self) -> dict:
+        return {}
+
+    def save(self, folder: Path) -> None:
+        pass
+
+    def load(self, folder: Path) -> None:
+        pass
+
+
+def shared(robot_cls):
+    """Registry entry: one robot_cls instance acts for every robot (parameter sharing)."""
+    return _factory(robot_cls, shared=True)
+
+
+def independent(robot_cls):
+    """Registry entry: one robot_cls instance per robot, each learning on its own."""
+    return _factory(robot_cls, shared=False)
+
+
+def _factory(robot_cls, shared):
+    def make(spec, seed=0):
+        return _PerRobot(robot_cls, spec, seed, shared)
+    make.OBS = robot_cls.OBS    # every registry entry exposes OBS, like a Policy class does
+    return make
+
+
+class _PerRobot(Policy):
+    """Turns a RobotPolicy into a Policy by calling it once per robot, in robot order."""
+
+    def __init__(self, robot_cls, spec, seed, shared):
+        super().__init__(spec, seed)
+        self.is_shared = shared
+        if shared:
+            self.distinct = [robot_cls(spec, seed)]
+            self.robots = self.distinct * spec.n_robots
+        else:
+            self.distinct = [robot_cls(spec, seed + i) for i in range(spec.n_robots)]
+            self.robots = self.distinct
+
+    @property
+    def spec(self):
+        return self._spec
+
+    @spec.setter
+    def spec(self, spec):
+        self._spec = spec
+        for robot in getattr(self, "distinct", []):
+            robot.spec = spec
+        if getattr(self, "is_shared", False):
+            # One set of weights fits any fleet size, so follow a robot count that changed with
+            # the spec (rl.run evaluates with --eval-robots). An independent() policy cannot:
+            # it has exactly one instance per robot, fixed when it was built.
+            self.robots = self.distinct * spec.n_robots
+
+    @property
+    def training(self):
+        return self._training
+
+    @training.setter
+    def training(self, flag):
+        self._training = flag
+        for robot in getattr(self, "distinct", []):
+            robot.training = flag
+
+    def act(self, obs):
+        return [robot.act_one(o) for robot, o in zip(self.robots, obs)]
+
+    def update(self, obs, actions, rewards, next_obs, done):
+        for robot, *step in zip(self.robots, obs, actions, rewards, next_obs):
+            robot.update_one(*step, done)
+
+    def reset(self):
+        for robot in self.distinct:
+            robot.reset()
+
+    def configure(self, **opts):
+        for robot in self.distinct:
+            robot.configure(**opts)
+
+    def stats(self):
+        return self.distinct[0].stats()
+
+    def save(self, folder):
+        for sub, robot in self._folders(folder):
+            sub.mkdir(exist_ok=True)
+            robot.save(sub)
+
+    def load(self, folder):
+        # Shared weights fit any robot count; independent ones exist once per robot.
+        saved = len(list(folder.glob("robot_*")))
+        if not self.is_shared and saved != len(self.distinct):
+            raise ValueError(f"checkpoint has weights for {saved} independent robots, the env has "
+                             f"{len(self.distinct)}: use the same --robots as in training")
+        for sub, robot in self._folders(folder):
+            robot.load(sub)
+
+    def _folders(self, folder):
+        if self.is_shared:
+            return [(folder, self.distinct[0])]
+        return [(folder / f"robot_{i}", robot) for i, robot in enumerate(self.distinct)]
