@@ -9,5 +9,8 @@
 # Charts for rl.plot.
 matplotlib==3.10.3
 
+# Tables (rl/policies/central_q.py): the Isaac venv's version.
+numpy==2.3.1
+
 # Neural networks (rl/policies/ppo.py).
 torch==2.7.0
