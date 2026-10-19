@@ -11,13 +11,13 @@ $ppo = Start-Job -ArgumentList $PSScriptRoot, $py -ScriptBlock {
     Set-Location $root
     foreach ($n in 2, 3, 4) {
         & $py -m rl.run --policy ppo --robots $n --train --envs 8 --episodes 10000000 `
-            --max-minutes 30 --no-render --print-every 5000 --save "checkpoints/ppo_$n" *> "logs/ppo_$n.log"
+            --max-minutes 60 --no-render --print-every 5000 --save "checkpoints/ppo_$n" *> "logs/ppo_$n.log"
     }
 }
 
 # File Q-table, au premier plan
-$minutes = @{2 = 60; 3 = 30; 4 = 30}
-$eps     = @{2 = 15000000; 3 = 5000000; 4 = 5000000}
+$minutes = @{2 = 90; 3 = 60; 4 = 60}
+$eps     = @{2 = 15000000; 3 = 9000000; 4 = 6000000}
 foreach ($n in 2, 3, 4) {
     Write-Host "`n=== Q-table, $n robots ($($minutes[$n]) min) ===" -ForegroundColor Cyan
     & $py -m rl.run --policy central_q --robots $n --train --episodes 10000000 `
