@@ -128,6 +128,27 @@ python -m rl.bench search --policy-opt prior=checkpoints/long_s20000 --scenarios
 
 Settings: `prior`, `k` (default 4), `depth` (default 6), `when=near|always`.
 
+### Central Q-table: where tabular stops
+
+`central_q` (`rl/policies/central_q.py`) is one Q-table over the whole fleet: the state is every robot's
+`(position, heading, task)` and the action one of `6**n` joint actions, masked to the legal ones. It is a teaching
+baseline that shows the curse of dimensionality, not a model to tune. `--policy-opt max_mb=` caps the table; past it,
+new states are dropped and counted (`dropped` in `train_log.csv`).
+
+`run_all.ps1` trains it and PPO at 2, 3 and 4 robots on the default 7x6 map (4 h in total), then
+`python -m rl.qtable_report --robots 2 3 4 --episodes 100` plays both against greedy on held-out seeds
+900000000+ and writes `results/qtable_table.md`:
+
+| robots | joint actions | theoretical states | visited | Q-table | greedy | PPO | unseen states in eval |
+|---|---|---|---|---|---|---|---|
+| 2 | 36 | 5.35e6 | 3.2M (439 MB) | 1.23 ± 2.05 | 8.57 ± 1.74 | 12.82 ± 1.03 | 0 % |
+| 3 | 216 | 1.24e10 | 0.73M (600 MB cap) | 0.00 | 10.56 ± 2.56 | 16.86 ± 1.74 | 99.5 % |
+| 4 | 1 296 | 2.86e13 | 0.12M (600 MB cap) | 0.00 | 10.30 ± 3.84 | 17.97 ± 2.11 | 100 % |
+
+At 2 robots the table has seen every evaluation state and still delivers barely once an episode (57M training steps,
+90 min); from 3 robots on it hits the memory cap and almost every evaluation state is new, so it acts blind.
+PPO generalises through its features and keeps gaining with the fleet size.
+
 ## Writing an algorithm (guide for the algorithm team)
 
 You only ever touch two places: your own file in `rl/policies/`, and one import plus one line in

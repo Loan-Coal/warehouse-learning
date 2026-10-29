@@ -1,0 +1,10 @@
+episode 5000: deliveries 12.2  value 12.2  blocked 0.6  invalid 0.0  mean return 55.94  job ratio 1.06  undone 0.01  reversal 0.00  [500000 steps, 1213/s]
+episode 10000: deliveries 12.5  value 12.5  blocked 1.0  invalid 0.0  mean return 57.00  job ratio 1.06  undone 0.00  reversal 0.00  [1000000 steps, 1325/s]
+episode 15000: deliveries 13.4  value 13.4  blocked 0.8  invalid 0.0  mean return 61.50  job ratio 1.06  undone 0.00  reversal 0.00  [1500000 steps, 1291/s]
+episode 20000: deliveries 11.4  value 11.4  blocked 0.4  invalid 0.0  mean return 51.69  job ratio 1.15  undone 0.02  reversal 0.04  [2000000 steps, 1355/s]
+episode 25000: deliveries 12.8  value 12.8  blocked 0.6  invalid 0.0  mean return 58.44  job ratio 1.07  undone 0.00  reversal 0.00  [2500000 steps, 1396/s]
+episode 30000: deliveries 13.2  value 13.2  blocked 0.6  invalid 0.0  mean return 60.94  job ratio 1.04  undone 0.00  reversal 0.00  [3000000 steps, 1425/s]
+episode 35000: deliveries 13.6  value 13.6  blocked 1.1  invalid 0.0  mean return 62.56  job ratio 1.05  undone 0.01  reversal 0.00  [3500000 steps, 1433/s]
+episode 40000: deliveries 13.0  value 13.0  blocked 1.2  invalid 0.0  mean return 59.38  job ratio 1.05  undone 0.00  reversal 0.00  [4000000 steps, 1420/s]
+episode 45000: deliveries 13.6  value 13.6  blocked 0.5  invalid 0.0  mean return 62.88  job ratio 1.04  undone 0.00  reversal 0.00  [4500000 steps, 1405/s]
+saved checkpoint to checkpoints/ppo_2
