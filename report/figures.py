@@ -18,6 +18,7 @@ OUT = ROOT / "report" / "figures"
 SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")      # même palette que rl/plot.py, ordre fixe
 INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 STEPS_PER_EPISODE = 100
+BIG_STEPS_PER_EPISODE = 400          # big : 400 pas par épisode
 ROBOTS = (2, 3, 4)
 
 plt.rcParams.update({
@@ -163,6 +164,41 @@ def fig_ladder():
     save(fig, "ladder")
 
 
+def eval_points(name):
+    """results/logs/<name>.txt -> (épisodes, livraisons) des lignes « eval @ » (labyrinthes inédits)."""
+    text = (ROOT / "results" / "logs" / f"{name}.txt").read_text(encoding="utf-8")
+    pts = re.findall(r"eval @ (\d+): deliveries ([\d.]+)", text)
+    return np.array([int(e) for e, _ in pts]), np.array([float(d) for _, d in pts])
+
+
+def ladder_mean(name, algo):
+    with open(ROOT / "results" / f"{name}.csv", encoding="utf-8") as f:
+        return np.mean([float(r["deliveries"]) for r in csv.DictReader(f) if r["algorithm"] == algo])
+
+
+def fig_big():
+    """big : PPO avec et sans relations de conflit (3 graines), glouton et planificateur en repère."""
+    fig, ax = plt.subplots(figsize=(6.2, 3.1))
+    for i, (prefix, label) in enumerate((("f1", "PPO avec relations de conflit"),
+                                         ("long", "PPO sans relations de conflit"))):
+        runs = [eval_points(f"{prefix}_s{s}") for s in (10000, 20000, 30000)]
+        n = min(len(e) for e, _ in runs)
+        x = runs[0][0][:n] * BIG_STEPS_PER_EPISODE / 1e6
+        y = np.array([d[:n] for _, d in runs])
+        ax.fill_between(x, y.min(0), y.max(0), color=SERIES[i], alpha=0.2, linewidth=0)
+        ax.plot(x, y.mean(0), color=SERIES[i], linewidth=1.6, marker="o", markersize=3, label=label)
+    for value, label, style in ((ladder_mean("ladder_future", "planner"), "planificateur, futur connu", "--"),
+                                (ladder_mean("ladder_obs", "greedy"), "glouton", ":")):
+        ax.axhline(value, color=MUTED, linewidth=1, linestyle=style)
+        ax.annotate(f"{label} ({value:.1f})".replace(".", ","), (20, value), xytext=(0, 3),
+                    textcoords="offset points", ha="right", fontsize=8, color=MUTED)
+    ax.set_xlabel("Pas d'entraînement (millions)")
+    ax.set_ylabel("Livraisons par épisode")
+    ax.set_ylim(8, 23)
+    ax.legend(fontsize=8.5, loc="upper right")
+    save(fig, "big")
+
+
 if __name__ == "__main__":
     rows = qtable_rows()
     fig_scaling(rows)
@@ -170,3 +206,4 @@ if __name__ == "__main__":
     fig_q_curves()
     fig_ppo_curves(rows)
     fig_ladder()
+    fig_big()

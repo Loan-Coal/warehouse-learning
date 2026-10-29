@@ -6,6 +6,7 @@
 \usepackage[french]{babel}
 \usepackage{lmodern}
 \usepackage[margin=2.3cm]{geometry}
+\usepackage{graphicx}
 
 \title{Apprentissage par renforcement \\ multi-robots pour un entrepôt automatisé}
 \author{
@@ -32,7 +33,7 @@ L'entrepôt est une grille d'allées, d'étagères et de quais : soit une carte 
 
 \section{Méthodes}
 
-Les deux approches sont comparées à une même référence, un glouton : à chaque pas, chaque robot calcule un plus court chemin vers sa cible en contournant les robots et humains visibles. Une action aléatoire une fois sur dix évite que deux robots face à face se bloquent indéfiniment. Sur big, une seconde référence, non apprise, sert de plafond : un planificateur espace-temps où chaque robot réserve les cases qu'il occupera pas à pas, si bien que les robots ne se bloquent jamais entre eux. Il est testé avec trois niveaux d'information : ce que voit PPO, la position de tous les humains, ou leurs déplacements futurs.
+Les deux approches sont comparées à une même référence, un glouton : à chaque pas, chaque robot suit un plus court chemin vers sa cible en contournant les robots et humains visibles. Il joue une action au hasard une fois sur dix, pour ne pas rester bloqué face à un autre robot. Sur big, une seconde référence, non apprise, s'y ajoute : un planificateur espace-temps où chaque robot réserve à l'avance les cases qu'il occupera, si bien que les robots ne se bloquent jamais entre eux. Il reçoit soit ce que voit PPO, soit les déplacements futurs des humains.
 
 \subsection{Approche centralisée}
 
@@ -40,9 +41,13 @@ Les deux approches sont comparées à une même référence, un glouton : à cha
 Un seul contrôleur choisit l'action jointe de toute la flotte et l'apprend par Q-learning~\cite{watkins1992}. L'état regroupe la position, l'orientation et la tâche de chaque robot. Sur la carte 7x6, cela fait $2312^n$ états et $6^n$ actions jointes pour n robots : 5 millions d'états et 36 actions à 2 robots, 29 000 milliards d'états et 1296 actions à 4 robots. La table est plafonnée à 600 Mo de mémoire.
 
 \subsubsection{PPO}
-Pour dépasser cette limite, un seul réseau de neurones contrôle toute la flotte. Il ne lit pas un état joint : pour chaque robot, il combine ses propres caractéristiques à ses relations avec chacun des autres robots (distance, « l'autre est sur mon chemin », « nous visons la même case »), puis produit son action. Comme ces entrées ne dépendent ni de la carte ni du nombre de robots, le même réseau s'applique à toute taille de flotte et à des labyrinthes jamais vus.
+Pour dépasser cette limite, un seul réseau de neurones contrôle toute la flotte, sans jamais lire l'état joint. Chaque robot $i$ est décrit par un vecteur $x_i$ : position, orientation, tâche, rayons, et distance et direction vers sa cible. Pour chaque autre robot $j$, le réseau calcule $\phi(x_i, x_j, c_{ij})$, où $c_{ij}$ regroupe des relations de conflit : distance de plus court chemin entre les deux robots, « $j$ est sur mon chemin », « nous visons la même case ». La politique du robot $i$ s'écrit :
+\[
+\pi(a_i \mid s) = f\Big(x_i,\ \max_{j \neq i} \phi(x_i, x_j, c_{ij}),\ \frac{1}{n-1}\sum_{j \neq i} \phi(x_i, x_j, c_{ij})\Big)
+\]
+Le maximum indique si un robot menace $i$, la moyenne si l'allée est encombrée. Ces entrées ne dépendent ni de la carte ni du nombre de robots : le même réseau s'applique à toute taille de flotte et à des labyrinthes jamais vus.
 
-Le réseau a deux sorties : une politique, qui donne la probabilité de chaque action, et un critique, qui estime la valeur de l'état et sert à juger si une action a fait mieux que prévu. PPO~\cite{schulman2017} met à jour la politique sur des trajectoires récentes en limitant l'ampleur de chaque changement, ce qui stabilise l'apprentissage. Nous l'avons préféré à une méthode à mémoire de rejeu, car les robots apprennent ensemble et le labyrinthe change à chaque épisode : d'anciennes transitions décriraient une dynamique qui n'existe plus. Sur la carte 7x6, chaque taille de flotte est entraînée 60 minutes sur 8 entrepôts simulés en parallèle. Sur big, chaque modèle est entraîné 25 000 épisodes (10 millions de pas, environ 5 h 30) sur 16 entrepôts en parallèle, avec trois graines.
+PPO~\cite{schulman2017} entraîne ce réseau avec un critique, qui estime la valeur de l'état, et limite l'ampleur de chaque mise à jour. Les actions des robots sont tirées indépendamment, et chaque robot apprend de son propre avantage. PPO apprend sur des trajectoires récentes. Une mémoire de rejeu mélangerait des labyrinthes et des versions des autres robots qui n'existent plus. Sur la carte 7x6, chaque taille de flotte est entraînée 60 minutes sur 8 entrepôts simulés en parallèle. Sur big, chaque modèle est entraîné 25 000 épisodes (10 millions de pas, environ 5 h 30) sur 16 entrepôts en parallèle, avec trois graines.
 
 Quatre choix, mesurés un par un, ont rendu l'apprentissage possible. Masquer les actions impossibles~\cite{huang2022} fait passer les actions invalides d'environ 1128 par épisode à 0. Donner au réseau la distance de plus court chemin à sa cible et la direction à suivre, plutôt que la carte entière, lui évite d'avoir à calculer un chemin qu'il ne sait pas trouver seul. Ajouter un indicateur de voisin immédiat dans chaque direction fait passer les blocages de 45,2 à 12,6 par épisode. Enfin, tirer les actions au hasard selon la politique, plutôt que de prendre la plus probable, empêche deux robots identiques face à face de se refléter indéfiniment, ce qui coûtait 211 blocages par épisode.
 
@@ -75,25 +80,18 @@ La Q-table ne livre qu'une caisse par épisode à 2 robots, après 57 millions d
 
 PPO dépasse le glouton à chaque taille, et l'écart grandit avec la flotte : +50 \% à 2 robots, +74 \% à 4. Il atteint son plateau en moins d'un million de pas, soit plus de 50 fois moins d'expérience que la Q-table à 2 robots. Le glouton, lui, plafonne dès 3 robots, car il passe son temps à contourner les autres.
 
-Sur le scénario big, nous évaluons chaque méthode sur 100 labyrinthes jamais vus. Pour mesurer l'apport des relations de conflit (« l'autre est sur mon chemin », « nous visons la même case »), nous comparons à budget presque égal (25 000 épisodes avec, 24 000 sans) le même réseau entraîné avec et sans elles.
+Sur le scénario big, chaque méthode est évaluée sur 100 labyrinthes jamais vus. Pour mesurer l'apport des relations de conflit, nous entraînons aussi le même réseau sans elles, deux fois plus longtemps.
 
-\begin{table}[htbp]
+\begin{figure}[htbp]
 \centering
-\begin{tabular}{lcc}
-\hline
-Méthode & Livraisons & Ratio de trajet \\
-\hline
-Glouton & 10,61 ± 4,35 & 2,12 \\
-Planificateur, ce que voit PPO & 13,12 ± 7,55 & 1,27 \\
-Planificateur, futur des humains connu & 13,47 ± 8,16 & 1,20 \\
-PPO sans relations de conflit (3 graines) & 18,09 (17,4 à 18,5) & 1,56 \\
-PPO avec relations de conflit (3 graines) & 21,30 (21,0 à 21,7) & 1,40 \\
-\hline
-\end{tabular}
-\caption{Scénario big, 100 labyrinthes jamais vus. Livraisons par épisode : moyenne ± écart-type, ou moyenne des trois graines et leur étendue. Ratio de trajet : actions par tâche divisées par le minimum nécessaire à un robot seul.}
-\end{table}
+\includegraphics[width=0.75\linewidth]{figures/big.pdf}
+\caption{Scénario big : livraisons par épisode pendant l'entraînement, avec et sans relations de conflit. Courbe : moyenne de trois graines. Bande : leur étendue. Chaque point est évalué sur 20 labyrinthes jamais vus. Lignes : glouton et planificateur, sur 100 labyrinthes.}
+\label{fig:big}
+\end{figure}
 
-PPO livre deux fois plus que le glouton. Les relations de conflit ajoutent 3,2 livraisons, alors que les trois graines ne s'écartent que d'une livraison au plus. PPO dépasse aussi le planificateur : celui-ci ne bloque jamais un autre robot, mais attend son tour sur les cases réservées par les autres, et même connaître l'avenir des humains ne lui rapporte que 0,35 livraison. Les trajectoires de PPO sont aussi plus directes : le glouton revient sur la case qu'il vient de quitter dans un tiers de ses déplacements, car chaque pas change ce que voient ses rayons et il hésite entre deux chemins, contre 5 \% pour PPO.
+Avec les relations de conflit, PPO livre 21,30 caisses par épisode (21,0 à 21,7 selon la graine), deux fois plus que le glouton (10,61 ± 4,35). Sans elles, il plafonne entre 18,1 et 18,8, même après deux fois plus d'entraînement. Avec elles, il dépasse ce plafond dès 3 millions de pas. À budget presque égal (25 000 épisodes avec, 24 000 sans), l'écart est de 3,2 livraisons, alors que les trois graines ne s'écartent que d'une livraison au plus.
+
+PPO dépasse aussi le planificateur, qui livre 13,12 caisses, et 13,47 s'il connaît l'avenir des humains. Celui-ci ne bloque jamais un autre robot, mais attend son tour sur les cases réservées par les autres. Ses trajets restent pourtant les plus directs. Son ratio de trajet, c'est-à-dire les actions par tâche divisées par le minimum nécessaire à un robot seul, vaut 1,20 à 1,27, contre 1,40 pour PPO et 2,12 pour le glouton. PPO ne fait donc pas des trajets plus courts : il en mène plus de front. Le glouton, lui, revient sur la case qu'il vient de quitter dans un tiers de ses déplacements, contre 5 \% pour PPO. Chaque pas change ce que voient ses rayons, et il hésite entre deux chemins.
 
 \subsection{Approche décentralisée}
 
@@ -111,7 +109,7 @@ Le contrôle centralisé tabulaire illustre concrètement la malédiction de la 
 [À compléter par Juliette et Loïc.]
 
 \subsection{Limites}
-Sur la carte 7x6, chaque configuration n'a été entraînée qu'avec une seule graine, faute de temps : les écarts entre PPO et le glouton (4 à 8 livraisons) dépassent largement le bruit d'évaluation (0,2 à 0,45 livraison), mais nous n'y avons pas mesuré la variance d'un entraînement à l'autre. Sur big, trois graines par configuration la bornent à une livraison.
+Sur la carte 7x6, chaque configuration n'a été entraînée qu'avec une seule graine, faute de temps : les écarts entre PPO et le glouton (4 à 8 livraisons) dépassent largement le bruit d'évaluation (0,2 à 0,45 livraison), mais nous n'y avons pas mesuré la variance d'un entraînement à l'autre. Sur big, trois graines par configuration la bornent à une livraison. Les points intermédiaires de la figure~\ref{fig:big} ne portent que sur 20 labyrinthes, soit environ une livraison de bruit.
 
 [Limites de l'approche décentralisée, à compléter par Juliette et Loïc.]
 
@@ -120,7 +118,7 @@ Une méthode comme QMIX~\cite{rashid2018}, qui combine des valeurs par robot en 
 
 \section{Conclusion}
 
-Nous avons étudié la coordination d'une flotte de robots dans un entrepôt selon deux approches. Côté centralisé, la Q-table jointe sature dès 3 robots, tandis que PPO, en raisonnant robot par robot plutôt que sur l'état joint, dépasse une heuristique de plus court chemin à toutes les tailles de flotte, avec un écart qui croît avec la taille de la flotte, et généralise à des labyrinthes jamais vus : sur big, il livre 21,3 caisses contre 10,6 pour le glouton, dont 3,2 dues aux relations de conflit entre robots. Ce résultat tient autant à des choix simples, mesurés un par un, qu'à l'algorithme : masquer les actions impossibles, donner au réseau la distance à sa cible plutôt que la carte entière, et lui signaler ses voisins immédiats.
+Nous avons étudié la coordination d'une flotte de robots dans un entrepôt selon deux approches. Côté centralisé, la Q-table jointe sature dès 3 robots, tandis que PPO, en raisonnant robot par robot plutôt que sur l'état joint, dépasse une heuristique de plus court chemin à toutes les tailles de flotte, avec un écart qui croît avec la taille de la flotte, et généralise à des labyrinthes jamais vus : sur big, il livre 21,3 caisses contre 10,6 pour le glouton. Sans les relations de conflit entre robots, même deux fois plus d'entraînement ne comble pas l'écart. Ce résultat tient autant à des choix simples, mesurés un par un, qu'à l'algorithme : masquer les actions impossibles, donner au réseau la distance à sa cible plutôt que la carte entière, et lui signaler ses voisins immédiats.
 
 [À compléter par Juliette et Loïc : conclusion sur l'approche décentralisée.]
 
