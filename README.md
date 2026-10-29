@@ -32,6 +32,8 @@ episodes without drawing. Save the "brain" to a folder (a checkpoint); replay it
 | `rl/` | algorithm team | algorithms (`rl/policies/`), their interface (`policy.py`), flags (`cli.py`), episode loop (`loop.py`), train/eval (`run.py`), benchmark (`bench.py`), charts (`plot.py`), and three shared helpers: what the env will not tell you (`nav.py`), the network inputs (`features.py`), many envs at once (`vecenv.py` + `vecloop.py`) | `env`, torch, matplotlib; never Isaac |
 | `isaac/` | visualization | draws `env.get_state()` in Isaac Sim with NVIDIA warehouse assets | `env`, `rl`, Isaac Sim |
 | `tests/` | shared | one file per area; `test_env.py` is the contract and `test_policies.py` runs every registered algorithm | |
+| `report/`, `run_all.ps1` | Antoine | the LaTeX report (`main.tex`), its figures (`figures.py`) and slides (`slides.py`); `run_all.ps1` is the 4 h Q-table vs PPO pipeline | matplotlib, pandas, python-pptx (not in `requirements.txt`) |
+| `rl/train_q.py`, `rl/policies/q_learning.py`, `isaac/demo_q_learning.py`, `Independant-Q-learning.ipynb` | Juliette, Loïc | independent Q-learning, standalone (see [How to run each system](#how-to-run-each-system)) | numpy, Isaac Sim for the demo |
 
 **Read [LEARNINGS.md](LEARNINGS.md) before you write an algorithm.** It is what was measured rather than assumed:
 why the action mask exists, why the reward shaping is not the textbook form, why there are no exploration
@@ -63,6 +65,82 @@ python -m rl.run --help                            # every flag
 ```
 
 Always run from the repo root with `python -m`, so that `env` and `rl` can be imported.
+
+## How to run each system
+
+| System | Author | Kind | Details |
+|---|---|---|---|
+| `greedy` | Lohann | baseline, no training | [Baselines](#baselines-the-numbers-to-beat) |
+| `ppo` | Lohann | trained (the main result) | [LEARNINGS.md](LEARNINGS.md), "Centralised PPO" |
+| `planner` | Lohann | benchmark, no training | [Planner](#planner-the-ceiling) |
+| `search` | Lohann | evaluation only, wraps a PPO checkpoint | [Search](#search-ppo-plus-lookahead) |
+| `central_q` | Antoine | trained | [Central Q-table](#central-q-table-where-tabular-stops) |
+| independent Q-learning | Juliette, Loïc | trained, standalone script | below |
+
+The first five go through the same two commands: `rl.run` (train, evaluate, watch) and `rl.bench` (compare).
+Only checkpoints of the current contract (v2) load; `b0_*` and `ent0*_*` were trained on the short-lived v3 (with
+`WAIT`) and are refused (LEARNINGS.md).
+
+**greedy**
+
+```powershell
+python -m rl.run --scenario big --seed 7                                        # watch
+python -m rl.bench greedy --scenarios big --episodes 100 --seed 90000 --new-map  # score
+```
+
+**ppo.** `checkpoints/long_s20000` was trained with these settings, 20.8M steps (~9 h at ~640 steps/s):
+
+```powershell
+python -m rl.run --policy ppo --scenario big --new-map --seed 20000 --train --envs 16 --episodes 10000000 `
+    --max-minutes 540 --no-render --print-every 1600 --eval-every 2500 --eval-episodes 20 --save checkpoints/ppo_big
+python -m rl.plot checkpoints/ppo_big                                           # learning curve
+python -m rl.bench =checkpoints/ppo_big --scenarios big --episodes 100 --seed 90000 --new-map
+```
+
+Ablations: add `--policy-opt conflict=0` (no pair conflict features) or `--policy-opt central=0` (a robot only pools
+the robots its rays hit).
+
+**planner** and **search**: no training. `search` takes its PPO checkpoint as `--policy-opt prior=`, not `--checkpoint`:
+
+```powershell
+python -m rl.bench planner --policy-opt info=obs --scenarios big --episodes 100 --seed 90000 --new-map
+python -m rl.bench search --policy-opt prior=checkpoints/long_s20000 --scenarios big --episodes 100 --seed 90000 --new-map
+```
+
+**central_q.** `run_all.ps1` calls `python`, so activate the venv first. It trains Q-table and PPO at 2, 3 and 4
+robots (4 h, into `checkpoints/q_<n>` and `checkpoints/ppo_<n>`) and then prints the table. One run, or only the table:
+
+```powershell
+.\run_all.ps1
+python -m rl.run --policy central_q --robots 2 --train --episodes 10000000 --max-minutes 90 --no-render `
+    --print-every 5000 --policy-opt eps_steps=15000000 --policy-opt max_mb=600 --save checkpoints/q_2
+python -m rl.qtable_report --robots 2 3 4 --episodes 100                        # needs q_<n> and ppo_<n>
+```
+
+**Report and slides.** Nothing is retrained, but `figures.py` reads `results/qtable_table.md` and
+`checkpoints/q_<n>/`, `checkpoints/ppo_<n>/`, which are not committed: run `run_all.ps1` first, or copy them from
+whoever did. Both scripts need two packages that are not in `requirements.txt`:
+
+```powershell
+pip install pandas python-pptx      # once
+python report/figures.py            # report/figures/*.pdf and *.png
+python report/slides.py             # report/presentation.pptx, from the committed figures
+```
+
+`report/main.tex` is the LaTeX source.
+
+**Independent Q-learning** (branch `indep-QL`). A standalone script: it is not registered in
+`rl/policies/__init__.py`, so `rl.run` and `rl.bench` do not run it. It trains one Q-table per robot (2 robots,
+default map, 100 episodes) and writes `q_tables.npy` into the current folder; the Isaac demo reads that file:
+
+```powershell
+python -m rl.train_q
+python -m isaac.demo_q_learning     # in the Isaac venv
+```
+
+`Independant-Q-learning.ipynb` is the notebook it came from.
+
+**3D replay** of any checkpoint above: [Replaying in 3D](#replaying-in-3d).
 
 ## Scenarios: choosing the difficulty
 
