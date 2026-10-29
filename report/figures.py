@@ -148,11 +148,11 @@ def fig_ladder():
         for algo, group in df.groupby("algorithm", sort=False):
             lab = label or {"greedy": "Glouton (BFS)", "planner": "Planner, info=obs"}[algo]
             entries.append((lab, group["deliveries"].mean(), group["deliveries"].std()))
-    entries.insert(1, ("PPO (12 h, LEARNINGS.md)", 18.3, None))
+    entries.insert(1, ("PPO (12 h)", 18.3, None))       # chiffre publié (LEARNINGS.md), checkpoint non local
     fig, ax = plt.subplots(figsize=(6.2, 2.9))
     y = np.arange(len(entries))[::-1]
     for yi, (lab, m, s) in zip(y, entries):
-        color = SERIES[2] if lab.startswith("PPO") else SERIES[0]
+        color = SERIES[2] if lab.startswith("PPO") else MUTED if lab.startswith("Glouton") else SERIES[0]
         ax.barh(yi, m, 0.62, xerr=s, color=color,
                 error_kw={"ecolor": MUTED, "elinewidth": 1, "capsize": 2})
         ax.annotate(f"{m:.1f}", (m + (s or 0), yi), xytext=(4, 0), textcoords="offset points",

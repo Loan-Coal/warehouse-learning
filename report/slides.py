@@ -412,18 +412,20 @@ def build():
 
     # 13. Échelle d'information --------------------------------------------------------------
     n += 1
-    s = content_slide(prs, "Ce que vaut l'information face à l'apprentissage",
-                      "Le planificateur réserve les cases dans l'espace-temps : les robots ne se bloquent jamais entre eux. "
-                      "Trois niveaux : ce que voit PPO, la position de tous les humains, et le futur réel des humains. "
-                      "À compléter avec les chiffres de search (Lohann).",
-                      kicker="Résultats · planificateur")
+    s = content_slide(prs, "Zéro collision ne veut pas dire plus de livraisons",
+                      "Le planificateur réserve les cases dans l'espace-temps : les robots ne se bloquent jamais entre eux, ses trajets sont les plus directs. "
+                      "Pourtant il livre 13,1 caisses contre 18,3 pour PPO, avec une forte variance : sur 11 à 14 labyrinthes sur 100 il livre moins de 5 caisses. "
+                      "Hypothèse : réserver un couloir d'une case condamne les autres à attendre. "
+                      "Savoir où sont les humains, ou même où ils iront, ne change rien de significatif (12,4 à 13,5, erreur-type 0,7) : "
+                      "l'écart avec PPO vient de ce qu'il a appris, pas de l'information. Search : chiffres à compléter (Lohann).",
+                      kicker="Résultats · planificateur, scénario big")
     if (FIG / "ladder.png").is_file():
         picture(s, "ladder", MARGIN, 1.7, w=8.0)
     bullets(s, 9.0, 1.95, 3.75, 4.6, [
-        [("obs : ", {"bold": True}), ("ce que voit PPO", {})],
-        [("state : ", {"bold": True}), ("position de tous les humains", {})],
-        [("future : ", {"bold": True}), ("où les humains vont aller", {})],
-        [("search : ", {"bold": True}), ("PPO + simulations à 6 pas, à compléter (Lohann)", {"color": MUTED})],
+        [("0 blocage, ", {"bold": True}), ("trajets les plus directs, mais 13,1 livraisons contre 18,3", {})],
+        [("Voir les humains, ", {"bold": True}), ("même leur futur : 12,4 à 13,5, dans le bruit", {})],
+        [("PPO a appris ", {"bold": True}), ("à partager les couloirs", {})],
+        [("search : ", {"bold": True}), ("à compléter (Lohann)", {"color": MUTED})],
     ], size=16)
     number_footer(s, n + 1)
 
