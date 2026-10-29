@@ -1,0 +1,396 @@
+% Rapport de projet -- warehouse-learning (M2, Apprentissage par renforcement)
+% Compiler sur Overleaf (pdfLaTeX) : téléverser main.tex et le dossier figures/.
+% Les passages \afaire{...} (en rouge) restent à compléter avant le rendu.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{{figures/}}
+\newcommand{\afaire}[1]{\textcolor{red}{[À FAIRE : #1]}}
+\newcommand{\code}[1]{\texttt{#1}}
+\setlist{itemsep=2pt,topsep=4pt}
+
+\title{Apprentissage par renforcement multi-robots\\pour un entrepôt automatisé}
+\author{Antoine de Chabannes \and Lohann Colle \and Juliette Girardin \and Loïc \afaire{nom}\\[4pt]
+\small Master 2 -- Apprentissage par renforcement, Université Côte d'Azur}
+\date{\afaire{date du rendu}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Nous étudions la coordination d'une flotte de chariots élévateurs autonomes dans un entrepôt modélisé
+comme une grille : chaque robot reçoit des tâches de rangement ou de prélèvement et doit naviguer sans
+gêner les autres robots ni les humains. Nous construisons un environnement paramétrable, une base de
+référence gloutonne et plusieurs familles d'agents : un Q-learning tabulaire centralisé, des
+apprenants indépendants, un PPO masqué centralisé à encodeur par paires, ainsi qu'un planificateur
+espace-temps et une recherche à la décision servant de points de comparaison. Le Q-learning tabulaire
+centralisé illustre concrètement la malédiction de la dimension : utilisable à 2 robots, il ne livre plus
+rien dès 3 robots, car 99,5\,\% des états rencontrés en évaluation n'ont jamais été vus. PPO, qui
+généralise par ses caractéristiques, dépasse le glouton à toutes les tailles de flotte (17,97 contre
+10,30 livraisons à 4 robots) et sur le scénario le plus difficile (18,3 contre 10,6).
+\end{abstract}
+
+% =====================================================================================
+\section{Introduction}
+
+Dans un entrepôt automatisé, des robots transportent des caisses entre des étagères et des quais.
+Le problème combine deux difficultés : chaque robot doit trouver un chemin dans un labyrinthe d'allées
+d'une case de large, et la flotte doit se coordonner pour que deux robots ne se bloquent pas face à face.
+Le nombre de configurations jointes croît exponentiellement avec la taille de la flotte, ce qui en fait
+un cas d'étude naturel pour comparer des méthodes tabulaires et approchées.
+
+Nous adoptons une architecture classique en logistique : \emph{navigation décentralisée, affectation
+centralisée}. Une file de tâches, qui joue le rôle du système de gestion d'entrepôt, attribue les
+missions ; chaque robot choisit ensuite ses déplacements. Nos questions sont :
+\begin{enumerate}
+  \item Jusqu'où une méthode tabulaire centralisée passe-t-elle à l'échelle (section~\ref{sec:qtable}) ?
+  \item Un apprenant par renforcement profond peut-il battre une heuristique de plus court chemin
+        bien réglée, et pourquoi (section~\ref{sec:ppo}) ?
+  \item Quelle part de l'écart à un planificateur omniscient tient à l'information disponible plutôt
+        qu'à l'apprentissage (section~\ref{sec:planner}) ?
+\end{enumerate}
+
+Le code (Python, PyTorch) est organisé en trois couches indépendantes : \code{env/} (l'environnement,
+sans dépendance), \code{rl/} (les algorithmes, l'entraînement et l'évaluation) et \code{isaac/}
+(un visualiseur 3D sous NVIDIA Isaac Sim qui rejoue un modèle entraîné, sans jamais entraîner).
+183 tests unitaires fixent le contrat de l'environnement et le comportement de chaque algorithme.
+
+% =====================================================================================
+\section{L'environnement}
+\label{sec:env}
+
+\subsection{Le monde}
+La carte est une grille d'allées (\code{.}), d'étagères (\code{S}) et de quais (\code{D}) ; seules les
+allées sont praticables. La carte par défaut fait $7\times6$ cases ; on peut aussi générer des
+labyrinthes d'étagères aléatoires (allées d'une case, quelques boucles pour permettre les
+contournements), et un \emph{nouveau labyrinthe à chaque épisode} pour interdire la mémorisation d'une carte.
+
+Chaque robot a une position et une orientation. Une tâche est soit un prélèvement (étagère vers quai),
+soit un rangement (quai vers étagère). À chaque pas, une tâche réalisable est ajoutée à la file avec
+probabilité 0,3 ; chaque robot inactif prend la tâche la plus prioritaire qu'il peut porter.
+
+\subsection{Actions, observation, récompense}
+\paragraph{Actions.} Six actions discrètes : \code{PICKUP}, \code{DROPOFF}, tourner à droite, tourner à
+gauche, avancer, reculer. Prendre ou déposer exige de \emph{faire face} à la case cible. Une action
+impossible est ignorée et pénalisée. Il n'y a pas d'action d'attente : rester sur place revient à tourner.
+
+\paragraph{Observation.} Chaque algorithme choisit les groupes de caractéristiques qu'il lit :
+position, orientation, tâche (porte-t-il une caisse, coordonnées de la cible), quatre rayons relatifs à
+l'orientation (distance et type du premier obstacle : mur, étagère, quai, robot, humain), propriétés
+de la caisse et du robot, carte locale $5\times5$. Les robots connaissent le plan du bâtiment mais
+ne voient les autres robots et les humains qu'à travers leurs rayons.
+
+\paragraph{Récompense.} Pour chaque robot : $+10\times$ valeur par livraison, $-0{,}05$ par pas,
+$-1$ en cas de blocage par un robot ou un humain, $-0{,}1$ pour une action invalide. La récompense
+finale mélange intérêt propre et intérêt collectif :
+\[
+  r_i = (1-\alpha)\, r_i^{\text{propre}} + \alpha \cdot \frac{1}{n}\sum_j r_j^{\text{propre}}, \qquad \alpha = 0{,}5 .
+\]
+
+\paragraph{Collisions.} Un déplacement vers un robot immobile, ou un échange de cases, est annulé ;
+si plusieurs robots visent la même case libre, un seul gagne (tirage aléatoire graine). Les humains se
+déplacent après les robots, au hasard, avec probabilité 0,5 par pas.
+
+\subsection{Scénarios}
+Tous les facteurs de complexité sont désactivés par défaut et s'activent par option. Les scénarios
+nommés en sont des préréglages ; les deux scénarios de référence sont :
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Scénario & Carte & Facteurs \\
+\midrule
+\code{basic} & $7\times6$ fixe, 100 pas & aucun \\
+\code{hard} & labyrinthe $11\times9$, 4 robots, 200 pas & caisses et robots hétérogènes, priorités, 2 humains \\
+\code{big} & labyrinthe $21\times21$, 6 robots, 400 pas & idem, 3 humains \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Avec \code{--mixed-robots}, la flotte alterne petits robots rapides et gros robots lents (une
+action tous les deux pas) qui seuls portent les caisses lourdes. Avec \code{--priority}, une livraison
+vaut $\text{priorité}\times\max(0{,}25,\, 1-\text{âge}/100)$.
+
+\subsection{Protocole d'évaluation}
+\label{sec:protocole}
+Une première version du projet affichait une « courbe d'apprentissage » qui ne mesurait que la
+décroissance d'un professeur glouton : le réseau n'avait rien appris en 3000 épisodes. Nous en avons tiré
+des règles strictes :
+\begin{itemize}
+  \item \textbf{Évaluation sur des cartes jamais vues}, disjointes de l'entraînement \emph{par construction}
+        (graines 90\,000+ pour les labyrinthes ; le lanceur refuse de démarrer si les plages se chevauchent).
+  \item \textbf{100 épisodes} par résultat : sur \code{hard}, l'écart-type est d'environ 3,4 livraisons, et 20 épisodes
+        ne distinguent pas deux politiques séparées de moins de 2 livraisons (le glouton passe de 5,00 sur 20 épisodes à
+        6,23 sur 100).
+  \item On rapporte d'abord les livraisons et les actions invalides, puis les blocages ; le retour moyen a un
+        plancher qui ne dépend pas de la politique.
+\end{itemize}
+
+\noindent Des métriques de « propreté » des trajectoires complètent les livraisons :
+\code{job\_ratio} (actions effectives sur le minimum nécessaire à un robot seul), taux de demi-tours
+annulés aussitôt, part de ceux-ci survenus près d'un autre agent, taux de retours sur la case précédente.
+
+% =====================================================================================
+\section{Méthodes}
+
+\subsection{Référence : le glouton}
+Chaque robot calcule à chaque pas un plus court chemin (BFS) vers sa cible en évitant les robots et
+humains visibles, se tourne puis avance. Deux robots identiques et déterministes peuvent se faire face
+indéfiniment dans une allée ; une action aléatoire avec probabilité $\varepsilon=0{,}1$, conservée en
+évaluation, casse cette symétrie. C'est un navigateur fort, donc une barre honnête.
+
+% -------------------------------------------------------------------------------------
+\subsection{Q-learning tabulaire centralisé}
+\label{sec:qtable}
+Un unique contrôleur choisit l'action jointe de toute la flotte. L'état est la concaténation, pour
+chaque robot, de (position, orientation, porte une caisse, a une tâche, cible) ; l'action jointe est un
+entier de $\{0,\dots,6^n-1\}$, restreint aux combinaisons dont chaque action individuelle est légale.
+La mise à jour est le Q-learning standard sur la somme des récompenses :
+\[
+  Q(s,a) \leftarrow Q(s,a) + \eta\,\Big(\textstyle\sum_i r_i + \gamma \max_{a' \text{ légale}} Q(s',a') - Q(s,a)\Big),
+  \qquad \eta = 0{,}1,\ \gamma = 0{,}95 .
+\]
+L'exploration est $\varepsilon$-gloutonne, décroissante linéairement de 1 à 0,05. La table est un dictionnaire
+dont les lignes ne sont créées qu'à la mise à jour ; au-delà d'un plafond mémoire (600\,Mo ici), les
+nouveaux états ne sont plus stockés et le taux de rejet est journalisé.
+
+Sur la carte par défaut, un robot a 34 cases, 4 orientations et 17 situations de tâche, soit
+$(34\cdot4\cdot17)^n$ états théoriques pour $n$ robots et $6^n$ actions jointes : $5{,}4\cdot10^6$ états
+et 36 actions à 2 robots, $2{,}9\cdot10^{13}$ états et 1296 actions à 4 robots. Ce modèle est volontairement
+naïf : c'est un point de comparaison pédagogique qui mesure \emph{où} le tabulaire cesse de fonctionner.
+
+% -------------------------------------------------------------------------------------
+\subsection{Apprenants indépendants (un cerveau par robot)}
+\label{sec:independant}
+\afaire{Section de Loïc et Juliette : Q-learning indépendant, chaque robot apprend sa propre table
+(branche \code{indep-QL}). Décrire l'état, la mise à jour, la non-stationnarité induite par les autres
+apprenants, et les résultats.}
+
+% -------------------------------------------------------------------------------------
+\subsection{PPO masqué centralisé}
+\label{sec:ppo}
+
+\paragraph{Pourquoi \emph{on-policy}.} Les robots partagent les mêmes poids et apprennent ensemble : une
+mémoire de rejeu contiendrait des transitions dont l'issue dépendait d'anciennes versions des \emph{autres}
+robots, donc d'une dynamique qui n'existe plus. Le labyrinthe change aussi à chaque épisode, et une mémoire
+mélangerait les cartes. PPO apprend sur des trajectoires fraîches d'une seule carte ; nous acceptons une
+moins bonne efficacité en échantillons, car le facteur limitant est le débit de simulation.
+
+\paragraph{Architecture.} Un seul réseau lit les lignes de caractéristiques de tous les robots. Pour le
+robot $i$, un encodeur par paires $\phi([x_i, x_j, c_{ij}])$ (MLP, largeur 128) est appliqué à chaque autre
+robot $j$, où $c_{ij}$ contient des relations construites à la main (distance dans le graphe, « $j$ est
+sur mon chemin », « nous visons la même case au prochain pas »). Les sorties sont agrégées par maximum
+(« un robot au moins est-il une menace ? ») et par moyenne (« à quel point est-ce encombré ? »), puis une
+tête (deux couches de 256) produit 6 logits. Les actions des robots sont tirées indépendamment, chacun
+étant entraîné sur son propre avantage. Une version précédente utilisait seulement la moyenne de la
+flotte ; or une moyenne de coordonnées absolues ne peut pas exprimer « un robot va entrer dans ma
+prochaine case », qui est une relation entre deux lignes.
+
+\paragraph{Ce qui a fait fonctionner l'apprentissage.} Chacun de ces choix a été mesuré :
+\begin{itemize}
+  \item \textbf{Masquage d'actions.} L'environnement ne dit pas ce qui est légal ; les logits des actions
+        impossibles sont fixés à $-10^9$ avant la loi catégorielle, ce qui règle d'un coup l'échantillonnage,
+        la log-probabilité et l'entropie. Actions invalides : environ 1128 par épisode $\to$ 0.
+  \item \textbf{Caractéristiques de plus court chemin.} Un MLP ne sait pas calculer un plus court chemin
+        dans un labyrinthe nouveau. Remplacer 882 dimensions de carte binaire par la distance BFS à la cible
+        et la direction qui la réduit (5 dimensions) est ce qui a rendu l'apprentissage possible, et explique la
+        généralisation à des cartes inédites : la carte n'entre jamais dans le réseau.
+  \item \textbf{Façonnage de récompense par différence simple.} Avec $\Phi = -d(\text{cible})$, la forme de
+        Ng et al.\ $\gamma\Phi(s')-\Phi(s)$ laisse un résidu $(\gamma-1)\Phi > 0$ qui, à distance 20, dépasse le
+        coût du pas : l'agent apprenait à flâner. La différence simple $\Phi(s')-\Phi(s)$ (cas $\gamma=1$) a un
+        résidu du bon signe et se télescope : aucun cycle ne rapporte.
+  \item \textbf{Signal de collision explicite.} Un indicateur « robot ou humain à distance exactement 1 dans
+        cette direction » a fait passer les blocages de 45,2 à 12,6 et les livraisons de 3,20 à 4,05 (600 épisodes).
+  \item \textbf{Politique stochastique contre l'interblocage.} Avec des poids partagés et un argmax, deux
+        robots face à face dans une allée se reflètent indéfiniment (211 blocages par épisode). Échantillonner
+        l'action, y compris en évaluation, brise la symétrie. Pendant l'entraînement l'entropie est passée de
+        0,556 à 0,166 \emph{pendant que} les blocages baissaient : la flotte apprenait à se coordonner, elle ne
+        s'appuyait pas sur le hasard.
+  \item \textbf{Pas de schedule.} Un run de 3000 épisodes avait passé 75\,\% de son temps à exploration minimale
+        avec un professeur retiré ; le taux d'apprentissage et le coefficient d'entropie sont donc constants.
+\end{itemize}
+
+\paragraph{Hyperparamètres.} $\gamma=0{,}99$, GAE $\lambda=0{,}95$, 128 pas par environnement entre deux mises à
+jour, 4 époques de 4 mini-lots, clip 0,2, taux d'apprentissage $3\cdot10^{-4}$, coefficient d'entropie 0,01,
+récompenses multipliées par 0,1 dans la cible uniquement. L'entraînement simule 8 à 16 entrepôts en
+parallèle dans un seul processus, ce qui rend un passage avant 7,9 fois moins coûteux par environnement ;
+le reste du temps est du Python (caractéristiques, masques, environnement), si bien qu'un GPU n'apporterait rien.
+
+% -------------------------------------------------------------------------------------
+\subsection{Points de comparaison non appris}
+\label{sec:planner}
+\paragraph{Planificateur espace-temps.} À chaque pas, chaque robot réserve les cases qu'il occupera tick par
+tick, la tâche la plus courte d'abord, et tous replanifient : par construction, les robots ne se bloquent
+jamais entre eux. Seuls les humains ne peuvent pas être réservés ; trois niveaux d'information bornent ce
+que vaut l'information : \code{obs} (ce que voit PPO), \code{state} (position de tous les humains),
+\code{future} (copie de l'environnement avec le vrai aléa : il sait où les humains vont aller).
+
+\paragraph{Recherche à la décision.} Autour d'un checkpoint PPO, lorsqu'un robot ou un humain est à moins de
+deux cases, on essaie chaque action légale de chaque robot dans des copies \emph{re-graines} de
+l'environnement, on déroule la flotte 6 pas avec PPO puis on amorce avec le critique, et on garde la meilleure
+action en moyenne sur 4 déroulements.
+
+% =====================================================================================
+\section{Résultats}
+
+\subsection{Passage à l'échelle : Q-table, glouton et PPO de 2 à 4 robots}
+Protocole : carte par défaut $7\times6$, 100 pas par épisode, sans humains. Q-table entraînée 90\,min
+(2 robots) puis 60\,min (3 et 4 robots) ; PPO 60\,min par taille, 8 environnements parallèles.
+Évaluation sur 100 épisodes à graines réservées ($9\cdot10^8+k$), sans apprentissage.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ccccccc}
+\toprule
+Robots & Actions & États & États & Livraisons & Livraisons & Livraisons \\
+       & jointes & théoriques & visités & Q-table & glouton & PPO \\
+\midrule
+2 & 36   & $5{,}35\cdot10^{6}$  & 3\,195\,477 & $1{,}23 \pm 2{,}05$ & $8{,}57 \pm 1{,}74$  & $\mathbf{12{,}82 \pm 1{,}03}$ \\
+3 & 216  & $1{,}24\cdot10^{10}$ & 728\,177     & $0{,}00$           & $10{,}56 \pm 2{,}56$ & $\mathbf{16{,}86 \pm 1{,}74}$ \\
+4 & 1296 & $2{,}86\cdot10^{13}$ & 121\,362     & $0{,}00$           & $10{,}30 \pm 3{,}84$ & $\mathbf{17{,}97 \pm 2{,}11}$ \\
+\bottomrule
+\end{tabular}
+\caption{Livraisons par épisode (moyenne $\pm$ écart-type). États inconnus de la Q-table en évaluation :
+0\,\% à 2 robots, 99,5\,\% à 3, 100\,\% à 4.}
+\label{tab:scaling}
+\end{table}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.78\linewidth]{scaling}
+\caption{Livraisons par épisode selon la taille de la flotte (100 épisodes d'évaluation).}
+\label{fig:scaling}
+\end{figure}
+
+\paragraph{La Q-table s'effondre dès 3 robots.} À 2 robots, la table a vu 60\,\% des états théoriques et
+\emph{tous} les états rencontrés en évaluation, mais ne livre qu'une caisse par épisode après 57 millions
+de pas. La figure~\ref{fig:qcurves} montre qu'elle progressait encore lentement à l'arrêt : le problème est
+résoluble en principe, mais chaque paire (état, action jointe) doit être visitée séparément. À 3 et 4
+robots, le plafond de 600\,Mo est atteint en moins d'un million de pas ; ensuite 98\,\% (3 robots) et
+99,6\,\% (4 robots) des mises à jour sont rejetées, l'exploration décroît sans que rien ne soit appris, et la courbe retombe à zéro. En
+évaluation, presque chaque état est inconnu et la table choisit à l'aveugle (figure~\ref{fig:states}).
+Le nombre d'états visités \emph{diminue} quand la flotte grandit, car chaque ligne coûte $6^n$ flottants :
+la mémoire, et non le temps de calcul, est le premier mur.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{q_curves}
+\caption{Entraînement de la Q-table centralisée. À gauche, les livraisons (pendant l'entraînement, exploration
+comprise) ; à droite, la taille de la table.}
+\label{fig:qcurves}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\linewidth]{states}
+\caption{États théoriques et états effectivement visités (échelle logarithmique).}
+\label{fig:states}
+\end{figure}
+
+\paragraph{PPO généralise.} PPO dépasse le glouton à chaque taille, et l'écart grandit avec la flotte
+(+50\,\% à 2 robots, +74\,\% à 4). Ses caractéristiques (distance à la cible, rayons, relations entre
+paires) ne dépendent ni de la carte ni du nombre de robots : un même réseau traite $n$ quelconque et deux
+états jamais vus mais semblables reçoivent des actions semblables. Il atteint son plateau en moins d'un
+million de pas (figure~\ref{fig:ppo}) ; le glouton, lui, ne progresse plus au-delà de 3 robots car il
+passe son temps à contourner les autres.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\linewidth]{ppo_curves}
+\caption{Entraînement de PPO (épisodes d'entraînement, actions échantillonnées). Pointillés : glouton
+évalué avec le même nombre de robots.}
+\label{fig:ppo}
+\end{figure}
+
+\subsection{Le scénario le plus difficile}
+Sur \code{big} (labyrinthe $21\times21$ nouveau à chaque épisode, 6 robots hétérogènes, priorités, 3 humains,
+400 pas), 100 labyrinthes jamais vus :
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+ & livraisons & job\_ratio & demi-tours annulés & dont près d'un agent & retours arrière \\
+\midrule
+Glouton & 10,6 & 2,12 & 0,048 & 0,58 & 0,340 \\
+PPO (12\,h, 155\,000 épisodes) & \textbf{18,3} & \textbf{1,50} & 0,085 & 0,985 & \textbf{0,081} \\
+\bottomrule
+\end{tabular}
+\caption{Qualité des trajectoires sur \code{big} (PPO à moyenne de flotte, contrat v2).}
+\label{tab:big}
+\end{table}
+
+\noindent Le glouton oscille : un tiers de ses déplacements reviennent sur la case précédente, car chaque pas
+change ce que voient ses rayons et il hésite entre deux chemins. Son \code{job\_ratio} de 2,1 vient de là,
+pas d'un mauvais routage. Les demi-tours annulés de PPO surviennent à 98,5\,\% près d'un autre agent :
+c'est sa manière d'\emph{attendre}, faute d'action d'attente. Nous avons testé une action \code{WAIT}
+(contrat v3) : elle accélère l'apprentissage (15,8 à 16,8 livraisons après 10\,000 épisodes contre 13,6),
+mais en évaluation déterministe deux robots identiques choisissent tous deux d'attendre, ce qui coûte
+environ 4 livraisons. Nous l'avons retirée pour garder un contrat unique.
+
+\subsection{Ce que vaut l'information}
+\label{sec:ladder}
+\afaire{Remplir avec results/ladder\_*.txt : glouton, planner obs/state/future sur big, et search
+(checkpoint PPO big, chiffres de Lohann). Insérer la figure \code{ladder}.}
+
+% =====================================================================================
+\section{Discussion et limites}
+\begin{itemize}
+  \item \textbf{Budgets inégaux.} Q-table et PPO ont eu un temps de calcul comparable, pas le même nombre de pas :
+        la Q-table simule environ 10\,600 pas/s contre 1\,400 pour PPO, soit 57 millions de pas contre 5 à
+        2 robots. La conclusion n'en est que plus nette : avec plus de 10 fois plus d'expérience, la table
+        reste loin derrière.
+  \item \textbf{Évaluation de la Q-table.} Pour un état inconnu, la table joue la première action jointe légale ;
+        une politique de repli (le glouton, par exemple) la rendrait meilleure, mais elle mesurerait le repli et
+        non la table.
+  \item \textbf{Les courbes d'entraînement} incluent l'exploration ; seuls les tableaux, sur graines
+        réservées, sont des résultats.
+  \item \textbf{Une seule graine d'entraînement} par configuration, faute de temps. Sur 100 épisodes l'erreur-type de
+        l'écart PPO/glouton est de 0,2 à 0,4 livraison, pour des écarts de 4 à 8 : ils dépassent largement le
+        bruit d'évaluation, mais pas la variance entre graines d'entraînement, que nous n'avons pas mesurée.
+  \item \textbf{Pistes.} Une approximation de $Q$ sur l'action factorisée (VDN, QMIX) ou des têtes
+        autorégressives (le robot $k$ voit les actions des robots $1..k-1$) ; vectoriser le calcul des
+        caractéristiques, qui est désormais le premier coût.
+\end{itemize}
+
+% =====================================================================================
+\section{Conclusion}
+Le Q-learning tabulaire centralisé fonctionne à peine à 2 robots et pas du tout au-delà : avec $6^n$
+actions jointes et $(34\cdot4\cdot17)^n$ états, la mémoire sature avant que l'apprentissage ne commence, et
+l'agent est aveugle sur 99,5\,\% des états d'évaluation dès 3 robots. PPO masqué, avec des caractéristiques
+de plus court chemin et un encodeur par paires, généralise à des cartes et des situations jamais vues et
+dépasse nettement une heuristique de plus court chemin, d'autant plus que la flotte est grande. Une grande
+partie de ce résultat tient moins à l'algorithme qu'à des choix mesurés un par un : masquer les actions,
+donner au réseau ce qu'il ne peut pas calculer, façonner la récompense sans biais vers la flânerie, et
+évaluer honnêtement.
+
+% =====================================================================================
+\appendix
+\section{Reproduire les résultats}
+\small
+\begin{verbatim}
+python -m unittest discover -s tests                 # 183 tests
+.\run_all.ps1                                        # Q-table et PPO, 2-4 robots (4 h)
+python -m rl.qtable_report --robots 2 3 4 --episodes 100
+python -m rl.bench greedy planner --scenarios big --episodes 100 \
+       --seed 90000 --new-map --out results/ladder_obs
+python report/figures.py                             # figures de ce rapport
+python -m isaac.demo --checkpoint checkpoints/ppo_4  # rejeu 3D (venv Isaac)
+\end{verbatim}
+
+\end{document}

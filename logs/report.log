@@ -1,0 +1,8 @@
+| Robots | Actions jointes | États théoriques | États visités | Mémoire Q (Mo) | Livraisons Q-table | Livraisons glouton | Livraisons PPO | États inconnus en éval (%) |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 36 | 5.35e+06 | 3 195 477 | 438.8 | 1.23 ± 2.05 | 8.57 ± 1.74 | 12.82 ± 1.03 | 0.0 |
+| 3 | 216 | 1.24e+10 | 728 177 | 600.0 | 0.00 ± 0.00 | 10.56 ± 2.56 | 16.86 ± 1.74 | 99.5 |
+| 4 | 1 296 | 2.86e+13 | 121 362 | 600.0 | 0.00 ± 0.00 | 10.30 ± 3.84 | 17.97 ± 2.11 | 100.0 |
+
+100 épisodes d'évaluation par ligne, carte par défaut 7x6, graines 900000000+k, sans apprentissage. Livraisons : moyenne ± écart-type par épisode. États théoriques : (34*4*17)^n.
+wrote results\qtable_table.md
