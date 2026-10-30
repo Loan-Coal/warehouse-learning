@@ -13,7 +13,7 @@ from skrl.memories.torch import RandomMemory
 from env.warehouse import Warehouse
 from env.layout import maze_layout
 from rl.policies.mappo_skrl import Actor, Critic, STATE_DIM
-from rl.policies.idqn_skrl import get_state, N_ACTIONS, OBS_DIM
+from rl.policies.idqn_skrl import get_state, get_action_mask, N_ACTIONS, OBS_DIM
 
 N_ROBOTS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,33 +29,21 @@ cfg["learning_rate"] = 5e-4
 cfg["mini_batches"] = 4
 cfg["discount_factor"] = 0.99
 cfg["gae_lambda"] = 0.95
-cfg["learning_rate_scheduler"] = None
 
 agents = []
 for i in range(N_ROBOTS):
     memory = RandomMemory(memory_size=500, num_envs=1, device=DEVICE)
     ag = PPO(
-        models={
-            "policy": Actor(obs_space, act_space, DEVICE),
-            "value": Critic(state_space, act_space, DEVICE)
-        },
-        memory=memory,
-        cfg=cfg,
-        observation_space=obs_space,
-        state_space=state_space,
-        action_space=act_space,
-        device=DEVICE
+        models={"policy": Actor(obs_space, act_space, DEVICE), "value": Critic(state_space, act_space, DEVICE)},
+        memory=memory, cfg=cfg, observation_space=obs_space, state_space=state_space, action_space=act_space, device=DEVICE
     )
     ag.init()
     agents.append(ag)
 
-print(f"CUDA disponible : {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"GPU utilisé : {torch.cuda.get_device_name(0)}")
-print("Entraînement MAPPO (Centralized Critic PPO) avec skrl 2.1.0...")
+print("Démarrage entraînement MAPPO avec Action Masking...")
 
 global_step = 0
-TOTAL_TIMESTEPS = 750000
+TOTAL_TIMESTEPS = 500000
 
 def dist_to_target(o):
     if isinstance(o, dict):
@@ -66,7 +54,7 @@ def dist_to_target(o):
         tx, ty = int(o[4]), int(o[5])
     return abs(tx - x) + abs(ty - y)
 
-for episode in range(1500):
+for episode in range(1200):
     obs, done = env.reset(seed=42 + episode), False
     while not done:
         states = [get_state(obs[i]) for i in range(N_ROBOTS)]
@@ -77,12 +65,20 @@ for episode in range(1500):
 
         for i in range(N_ROBOTS):
             st_tensor = torch.tensor(np.array([states[i]], dtype=np.float32), device=DEVICE)
-            joint_tensor = torch.tensor(np.array([joint_state], dtype=np.float32), device=DEVICE)
+            mask = get_action_mask(obs[i])
             
-            # Dépaquetage corrigé (2 valeurs retournées)
-            act, _ = agents[i].act(states=joint_tensor, observations=st_tensor, timestep=global_step, timesteps=TOTAL_TIMESTEPS)
-            actions.append(act.item())
-            actions_t.append(act)
+            with torch.no_grad():
+                out, _ = agents[i].models["policy"].compute({"observations": st_tensor})
+                logits = out.squeeze(0).clone()
+                for idx, is_valid in enumerate(mask):
+                    if not is_valid:
+                        logits[idx] = -1e9
+                probs = torch.softmax(logits, dim=-1)
+                dist = torch.distributions.Categorical(probs=probs)
+                chosen_act = dist.sample().item()
+
+            actions.append(chosen_act)
+            actions_t.append(torch.tensor([chosen_act], device=DEVICE))
 
         next_obs, rewards, done, info = env.step(actions)
         next_states = [get_state(next_obs[i]) for i in range(N_ROBOTS)]
@@ -90,15 +86,13 @@ for episode in range(1500):
 
         for i in range(N_ROBOTS):
             r = rewards[i]
-            if r == -1.0:
-                shaped_r = -2.0
-            elif r > 0:
+            if r > 0:
                 shaped_r = r * 2.0
             else:
                 d_before = dist_to_target(obs[i])
                 d_after = dist_to_target(next_obs[i])
                 progress = d_before - d_after
-                shaped_r = 0.2 * progress - 0.05
+                shaped_r = 0.3 * progress - 0.02
 
             s_t = torch.tensor(np.array([states[i]], dtype=np.float32), device=DEVICE)
             ns_t = torch.tensor(np.array([next_states[i]], dtype=np.float32), device=DEVICE)
@@ -108,17 +102,9 @@ for episode in range(1500):
             d_t = torch.tensor([[done]], dtype=torch.bool, device=DEVICE)
 
             agents[i].record_transition(
-                states=joint_t,
-                observations=s_t,
-                actions=actions_t[i],
-                rewards=rw_t,
-                next_states=next_joint_t,
-                next_observations=ns_t,
-                terminated=d_t,
-                truncated=d_t,
-                infos={},
-                timestep=global_step,
-                timesteps=TOTAL_TIMESTEPS
+                states=joint_t, observations=s_t, actions=actions_t[i], rewards=rw_t,
+                next_states=next_joint_t, next_observations=ns_t, terminated=d_t, truncated=d_t,
+                infos={}, timestep=global_step, timesteps=TOTAL_TIMESTEPS
             )
 
             agents[i].pre_interaction(timestep=global_step, timesteps=TOTAL_TIMESTEPS)
@@ -128,9 +114,9 @@ for episode in range(1500):
         global_step += 1
 
     if (episode + 1) % 100 == 0:
-        print(f"Épisode MAPPO {episode + 1}/1500 terminé (global_step: {global_step})")
+        print(f"Épisode MAPPO {episode + 1}/1200 terminé (global_step: {global_step})")
 
 os.makedirs("weights", exist_ok=True)
 for i in range(N_ROBOTS):
     torch.save(agents[i].models["policy"].state_dict(), f"weights/skrl_mappo_robot_{i}.pt")
-print("Sauvegarde MAPPO terminée dans 'weights/'.")
+print("Modèles MAPPO enregistrés.")

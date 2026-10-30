@@ -1,15 +1,9 @@
-"""Watch the warehouse env + Q-Learning policy in Isaac Sim.
-
-    python -m isaac.demo_q_learning
-"""
 import math
 import os
 import sys
 import traceback
 import numpy as np
-from rl.policies.greedy import GreedyPolicy
 
-# 1. Configuration SimulationApp exactement identique à demo.py
 from isaacsim import SimulationApp
 
 HEADLESS = os.environ.get("DEMO_HEADLESS", "").strip() == "1"
@@ -24,12 +18,10 @@ app_config = {
 
 app = SimulationApp(app_config)
 
-# 2. Imports de l'environnement & RL après SimulationApp
-from env.layout import DEFAULT_MAP, maze_layout  # noqa: E402
+from env.layout import maze_layout  # noqa: E402
 from env.warehouse import Warehouse  # noqa: E402
 from rl.policies.q_learning import QLearningPolicy  # noqa: E402
 
-# ------------------------------------------------------------- Configuration
 SEED = 0
 N_ROBOTS = 2
 MAX_STEPS = 200
@@ -38,7 +30,6 @@ FRAMES_PER_STEP = 20
 
 
 def make_policies(env):
-    """Charge q_tables.npy si présent, sinon crée des tables vierges."""
     q_file = "q_tables.npy"
     if os.path.exists(q_file):
         try:
@@ -48,19 +39,14 @@ def make_policies(env):
         except Exception as e:
             print(f"Erreur de chargement de {q_file}: {e}", flush=True)
 
-    print("Fichier q_tables.npy introuvable/invalide. Utilisation de politiques vierges.", flush=True)
+    print("Fichier q_tables.npy introuvable/invalide. Politiques par défaut.", flush=True)
     return [QLearningPolicy(np.zeros((2000000, 6))) for _ in range(env.n_robots)]
-    #return [GreedyPolicy(env.grid, seed=SEED)] * env.n_robots
-
-
-# -------------------------------------------------------------------------------------
 
 
 def main():
     import omni.ui as ui
     from isaacsim.core.utils import stage
     from isaacsim.core.utils.viewports import set_camera_view
-
     from isaac.scene import ROBOT_COLORS, WarehouseScene
 
     env = Warehouse(LAYOUT, n_robots=N_ROBOTS, max_steps=MAX_STEPS)
@@ -86,16 +72,11 @@ def main():
         actions = [p.act(o) for p, o in zip(policies, obs)]
         next_obs, rewards, done, info = env.step(actions)
 
-        for i, p in enumerate(policies):
-            if hasattr(p, "update"):
-                p.update(obs[i], actions[i], rewards[i], next_obs[i], done)
-
         for key in totals:
             totals[key] += info[key]
 
         new_state = env.get_state()
-        new_yaws = [heading(a, b, o, yaw) for a, b, o, yaw in
-                    zip(state["robots"], new_state["robots"], obs, yaws)]
+        new_yaws = [heading(a, b, o, yaw) for a, b, o, yaw in zip(state["robots"], new_state["robots"], obs, yaws)]
 
         for f in range(1, FRAMES_PER_STEP + 1):
             draw(scene, state, new_state, yaws, new_yaws, f / FRAMES_PER_STEP)
@@ -104,18 +85,21 @@ def main():
         stats.update(new_state, next_obs, totals)
         state, obs, yaws = new_state, next_obs, new_yaws
 
-    print(f"episode done: deliveries {totals['deliveries']}  blocked {totals['blocked']}  "
-          f"invalid {totals['invalid']}", flush=True)
+    print(f"Épisode terminé: livraisons {totals['deliveries']}  bloqués {totals['blocked']}  invalides {totals['invalid']}", flush=True)
 
     while app.is_running() and not HEADLESS:
         app.update()
 
 
 def heading(before, after, obs, yaw):
-    """Yaw pointing forks where the robot moved or at its target."""
     dx, dy = after["x"] - before["x"], after["y"] - before["y"]
     if (dx, dy) == (0, 0):
-        x, y, _carrying, has_task, tx, ty = obs[:6]
+        if isinstance(obs, dict):
+            x, y = obs["position"]
+            has_task = obs.get("carrying", False)
+            tx, ty = obs.get("target", (x, y))
+        else:
+            x, y, _, has_task, tx, ty = obs[:6]
         if not has_task or abs(tx - x) + abs(ty - y) != 1:
             return yaw
         dx, dy = tx - x, ty - y
@@ -123,7 +107,6 @@ def heading(before, after, obs, yaw):
 
 
 def draw(scene, before, after, yaws_before, yaws_after, t):
-    """Blend two env states."""
     from isaac.scene import grid_to_world
 
     robot_xy, robot_yaw = [], []
@@ -154,8 +137,6 @@ def draw(scene, before, after, yaws_before, yaws_after, t):
 
 
 class StatsPanel:
-    """A small window with running totals and robot tasks."""
-
     def __init__(self, ui, n_robots, colors):
         self.window = ui.Window("Warehouse Q-Learning", width=360, height=90 + 22 * n_robots)
         with self.window.frame:
@@ -168,7 +149,13 @@ class StatsPanel:
         self.summary.text = (f"step {state['step']}   deliveries {totals['deliveries']}   "
                              f"blocked {totals['blocked']}   invalid {totals['invalid']}   queue {state['queue_len']}")
         for i, (label, o) in enumerate(zip(self.robots, obs)):
-            x, y, carrying, has_task, tx, ty = o[:6]
+            if isinstance(o, dict):
+                x, y = o["position"]
+                carrying = o.get("carrying", False)
+                has_task = o.get("has_task", False)
+                tx, ty = o.get("target", (x, y))
+            else:
+                x, y, carrying, has_task, tx, ty = o[:6]
             doing = f"carrying to {tx, ty}" if carrying else f"going to pick up at {tx, ty}" if has_task else "idle"
             label.text = f"robot {i} ({self.colors[i][0]}): {doing}"
 

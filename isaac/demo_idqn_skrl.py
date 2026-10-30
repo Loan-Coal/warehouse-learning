@@ -39,16 +39,11 @@ def make_policies(env):
         weights_path = f"weights/skrl_idqn_robot_{i}.pt"
         if os.path.exists(weights_path):
             print(f"Chargement du modèle SKRL robot {i} : {weights_path}", flush=True)
-            pol = SKRLIDQNPolicy(weights_path=weights_path)
-            # Force l'inférence sur CPU pour éviter les conflits CUDA avec Isaac Sim
-            pol.device = torch.device("cpu")
-            pol.model.to(pol.device)
+            pol = SKRLIDQNPolicy(weights_path=weights_path, device="cpu")
             policies.append(pol)
         else:
             print(f"Fichier {weights_path} non trouvé. Modèle par défaut.", flush=True)
-            pol = SKRLIDQNPolicy()
-            pol.device = torch.device("cpu")
-            pol.model.to(pol.device)
+            pol = SKRLIDQNPolicy(device="cpu")
             policies.append(pol)
     return policies
 

@@ -1,61 +1,146 @@
+import math
 import os
+import sys
+import traceback
+import torch
+
 from isaacsim import SimulationApp
 
-# Instanciation de SimulationApp avant tout autre import Omniverse
-simulation_app = SimulationApp({"headless": False})
+HEADLESS = os.environ.get("DEMO_HEADLESS", "").strip() == "1"
 
-import torch
-import numpy as np
-from env.warehouse import Warehouse
+app_config = {
+    "headless": HEADLESS,
+    "settings": {
+        "/app/exts/fold/isaacsim.sensors.rtx": False,
+        "/exts/isaacsim.sensors.rtx/enabled": False,
+        # Désactivation des modules sujets aux conflits Jinja2
+        "/exts/omni.kit.window.extensions/enabled": False,
+        "/exts/omni.kit.browser.core/enabled": False
+    }
+}
+
+app = SimulationApp(app_config)
+
 from env.layout import maze_layout
+from env.warehouse import Warehouse
 from rl.policies.mappo_skrl import SKRLMAPPOPolicy
 
+SEED = 0
 N_ROBOTS = 2
+MAX_STEPS = 200
+LAYOUT = maze_layout(SEED, n_robots=N_ROBOTS)
+FRAMES_PER_STEP = 20
 
-# Initialisation de l'environnement de simulation 3D
-env = Warehouse(layout=maze_layout(42, n_robots=N_ROBOTS), n_robots=N_ROBOTS, max_steps=500)
 
-# Chargement des politiques MAPPO entraînées
-policies = []
-for i in range(N_ROBOTS):
-    weights_path = f"weights/skrl_mappo_robot_{i}.pt"
-    if os.path.exists(weights_path):
-        print(f"Chargement du modèle MAPPO robot {i} : {weights_path}")
-        pol = SKRLMAPPOPolicy(weights_path=weights_path, device="cpu")
-    else:
-        print(f"Poids non trouvés pour robot {i}, politique par défaut.")
-        pol = SKRLMAPPOPolicy(device="cpu")
-    policies.append(pol)
+def make_policies(env):
+    policies = []
+    for i in range(env.n_robots):
+        weights_path = f"weights/skrl_mappo_robot_{i}.pt"
+        if os.path.exists(weights_path):
+            print(f"Chargement du modèle MAPPO robot {i} : {weights_path}", flush=True)
+            pol = SKRLMAPPOPolicy(weights_path=weights_path, device="cpu")
+            policies.append(pol)
+        else:
+            print(f"Fichier {weights_path} non trouvé. Modèle par défaut.", flush=True)
+            pol = SKRLMAPPOPolicy(device="cpu")
+            policies.append(pol)
+    return policies
 
-# Réinitialisation de la scène
-obs = env.reset(seed=100)
-done = False
-step_count = 0
-total_deliveries = 0
-total_invalid = 0
 
-print("\n--- Début de la démonstration MAPPO ---")
+def main():
+    from isaacsim.core.utils import stage
+    from isaacsim.core.utils.viewports import set_camera_view
+    from isaac.scene import WarehouseScene
 
-while simulation_app.is_running() and not done:
-    actions = []
-    for i in range(N_ROBOTS):
-        # Sélection de l'action optimale déterministe via la politique
-        act = policies[i].act(obs[i])
-        actions.append(act)
+    env = Warehouse(LAYOUT, n_robots=N_ROBOTS, max_steps=MAX_STEPS)
+    obs = env.reset(SEED)
+    policies = make_policies(env)
+    state = env.get_state()
+    scene = WarehouseScene(state)
 
-    # Exécution du pas de temps
-    next_obs, rewards, done, info = env.step(actions)
-    env.render()
+    app.update()
+    while stage.is_stage_loading():
+        app.update()
 
-    for i in range(N_ROBOTS):
-        if rewards[i] >= 5.0:
-            total_deliveries += 1
-        elif rewards[i] == -1.0:
-            total_invalid += 1
+    set_camera_view(eye=scene.overview[0], target=scene.overview[1])
 
-    obs = next_obs
-    step_count += 1
+    yaws = [0.0] * env.n_robots
+    totals = {"deliveries": 0, "blocked": 0, "invalid": 0}
+    draw(scene, state, state, yaws, yaws, 1.0)
 
-print(f"\nÉpisode terminé : Pas = {step_count} | Livraisons = {total_deliveries} | Invalides = {total_invalid}")
+    done = False
+    while not done and app.is_running():
+        actions = [p.act(o) for p, o in zip(policies, obs)]
+        next_obs, rewards, done, info = env.step(actions)
 
-simulation_app.close()
+        for key in totals:
+            totals[key] += info[key]
+
+        new_state = env.get_state()
+        new_yaws = [heading(a, b, o, yaw) for a, b, o, yaw in zip(state["robots"], new_state["robots"], obs, yaws)]
+
+        for f in range(1, FRAMES_PER_STEP + 1):
+            draw(scene, state, new_state, yaws, new_yaws, f / FRAMES_PER_STEP)
+            app.update()
+
+        state, obs, yaws = new_state, next_obs, new_yaws
+
+    print(f"Épisode terminé: livraisons {totals['deliveries']}  bloqués {totals['blocked']}  invalides {totals['invalid']}", flush=True)
+
+    while app.is_running() and not HEADLESS:
+        app.update()
+
+
+def heading(before, after, obs, yaw):
+    dx, dy = after["x"] - before["x"], after["y"] - before["y"]
+    if (dx, dy) == (0, 0):
+        if isinstance(obs, dict):
+            x, y = obs["position"]
+            has_task = obs.get("carrying", False)
+            tx, ty = obs.get("target", (x, y))
+        else:
+            x, y, _, has_task, tx, ty = obs[:6]
+        if not has_task or abs(tx - x) + abs(ty - y) != 1:
+            return yaw
+        dx, dy = tx - x, ty - y
+    return math.atan2(dx, dy)
+
+
+def draw(scene, before, after, yaws_before, yaws_after, t):
+    from isaac.scene import grid_to_world
+
+    robot_xy, robot_yaw = [], []
+    for a, b, ya, yb in zip(before["robots"], after["robots"], yaws_before, yaws_after):
+        p = (1 - t) * grid_to_world(a["x"], a["y"]) + t * grid_to_world(b["x"], b["y"])
+        turn = (yb - ya + math.pi) % (2 * math.pi) - math.pi
+        robot_xy.append((p[0], p[1]))
+        robot_yaw.append(ya + t * turn)
+
+    def pose(crate):
+        if crate["carried_by"] is None:
+            return scene.resting_position(crate["x"], crate["y"]), scene.resting_yaw(crate["x"], crate["y"])
+        i = crate["carried_by"]
+        return scene.carried_position(robot_xy[i], robot_yaw[i]), robot_yaw[i]
+
+    old = {c["id"]: c for c in before["crates"]}
+    new = {c["id"]: c for c in after["crates"]}
+    crates = []
+    for cid in old.keys() | new.keys():
+        if cid in old and cid in new:
+            (p0, r0), (p1, r1) = pose(old[cid]), pose(new[cid])
+            crates.append((cid, ((1 - t) * p0 + t * p1, r1 if new[cid]["carried_by"] is not None else r0)))
+        elif cid in new:
+            crates.append((cid, pose(new[cid])))
+        else:
+            crates.append((cid, pose(old[cid]) if t < 1.0 else None))
+    scene.show(robot_xy, robot_yaw, crates)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.stderr.flush()
+    finally:
+        app.close()
