@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 q_tables.npy
 /weights/
+checkpoints/
+results/
