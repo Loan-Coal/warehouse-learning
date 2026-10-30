@@ -13,7 +13,6 @@ app_config = {
     "settings": {
         "/app/exts/fold/isaacsim.sensors.rtx": False,
         "/exts/isaacsim.sensors.rtx/enabled": False,
-        # Désactivation des modules sujets aux conflits Jinja2
         "/exts/omni.kit.window.extensions/enabled": False,
         "/exts/omni.kit.browser.core/enabled": False
     }
@@ -21,14 +20,14 @@ app_config = {
 
 app = SimulationApp(app_config)
 
-from env.layout import maze_layout
+from env.layout import DEFAULT_MAP, parse
 from env.warehouse import Warehouse
 from rl.policies.mappo_skrl import SKRLMAPPOPolicy
 
 SEED = 0
 N_ROBOTS = 2
 MAX_STEPS = 200
-LAYOUT = maze_layout(SEED, n_robots=N_ROBOTS)
+LAYOUT = DEFAULT_MAP
 FRAMES_PER_STEP = 20
 
 

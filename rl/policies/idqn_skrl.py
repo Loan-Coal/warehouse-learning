@@ -5,26 +5,42 @@ import numpy as np
 from skrl.models.torch import CategoricalMixin, Model
 
 N_ACTIONS = 6
-OBS_DIM = 10  # [x, y, carrying, has_task, dx_target, dy_target, n_up, n_down, n_left, n_right]
+OBS_DIM = 11  # [x, y, heading, carrying, has_task, dx_target, dy_target, n_up, n_down, n_left, n_right]
 
 NEIGHBOR_MAP = {"AISLE": 0, "WALL": 1, "SHELF_EMPTY": 2, "SHELF_PACKAGE": 3, "DOCK": 4}
 
 
 def get_state(obs):
-    """Extraction robuste du vecteur d'état à 10 dimensions."""
+    """Extraction 11D : x, y, heading, carrying, has_task, dx, dy + 4 voisins/rayons."""
     if isinstance(obs, dict):
-        x, y = obs["position"]
-        carrying = 1.0 if obs.get("carrying", False) else 0.0
+        x, y = obs.get("position", (0, 0))
+        heading = float(obs.get("heading", 0)) / 3.0
+        carrying = bool(obs.get("carrying", False))
         has_task = 1.0 if obs.get("has_task", False) else 0.0
-        tx, ty = obs.get("target", (x, y))
-        neighbors = obs.get("neighbors", ["AISLE"] * 4)
 
+        # --- AIGUILLAGE STRICT DE LA CIBLE DYNAMIQUE ---
+        # 1. Si mains vides -> Cible le colis
+        if not carrying and "crate_position" in obs:
+            tx, ty = obs["crate_position"]
+        # 2. Si colis en main -> Cible le dépôt
+        elif carrying and "dock_position" in obs:
+            tx, ty = obs["dock_position"]
+        # 3. Fallback sur target_x/y ou target de FEATURES
+        elif "target_x" in obs and "target_y" in obs:
+            tx, ty = obs["target_x"], obs["target_y"]
+        else:
+            tx, ty = obs.get("target", (x, y))
+
+        neighbors = obs.get("neighbors", ["AISLE"] * 4)
         n_vec = [float(NEIGHBOR_MAP.get(n, 0) if isinstance(n, str) else n) / 4.0 for n in neighbors]
+
     else:
+        # Format tableau Gym
         x, y = int(obs[0]), int(obs[1])
-        carrying = float(obs[2])
+        carrying = bool(obs[2])
         has_task = float(obs[3])
         tx, ty = int(obs[4]), int(obs[5])
+        heading = float(obs[14]) / 3.0 if len(obs) > 14 else 0.0
 
         n_vec = []
         for k in range(4):
@@ -32,10 +48,11 @@ def get_state(obs):
             type_id = obs[7 + 2 * k] if len(obs) > 7 + 2 * k else 0
             n_vec.append(float(type_id) / 5.0 if dist == 1 else 0.0)
 
+    # Vectorisation normalisée
     dx = (tx - x) / 20.0
     dy = (ty - y) / 20.0
 
-    vec = [x / 20.0, y / 20.0, carrying, has_task, dx, dy] + n_vec
+    vec = [x / 20.0, y / 20.0, heading, float(carrying), has_task, dx, dy] + n_vec
     return np.array(vec, dtype=np.float32)
 
 

@@ -22,14 +22,14 @@ app_config = {
 
 app = SimulationApp(app_config)
 
-from env.layout import maze_layout
+from env.layout import DEFAULT_MAP, parse
 from env.warehouse import Warehouse
 from rl.policies.idqn_skrl import SKRLIDQNPolicy
 
 SEED = 0
 N_ROBOTS = 2
 MAX_STEPS = 200
-LAYOUT = maze_layout(SEED, n_robots=N_ROBOTS)
+LAYOUT = DEFAULT_MAP
 FRAMES_PER_STEP = 20
 
 

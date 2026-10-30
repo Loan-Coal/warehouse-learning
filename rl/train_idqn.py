@@ -11,13 +11,13 @@ from skrl.agents.torch.dqn import DQN
 from skrl.memories.torch import RandomMemory
 
 from env.warehouse import Warehouse
-from env.layout import maze_layout
+from env.layout import DEFAULT_MAP, parse
 from rl.policies.idqn_skrl import QNet, get_state, get_action_mask, N_ACTIONS, OBS_DIM
 
 N_ROBOTS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-env = Warehouse(layout=maze_layout(42, n_robots=N_ROBOTS), n_robots=N_ROBOTS, max_steps=500)
+env = Warehouse(layout=DEFAULT_MAP, n_robots=N_ROBOTS, max_steps=200)
 obs_space = spaces.Box(low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32)
 act_space = spaces.Discrete(N_ACTIONS)
 
@@ -44,7 +44,7 @@ for i in range(N_ROBOTS):
     agents.append(ag)
 
 print(f"CUDA disponible : {torch.cuda.is_available()}")
-print("Démarrage entraînement IDQN avec Action Masking...")
+print("Démarrage entraînement IDQN sur DEFAULT_MAP avec Action Masking...")
 
 global_step = 0
 TOTAL_TIMESTEPS = 500000
@@ -70,10 +70,9 @@ for episode in range(1200):
             mask = get_action_mask(obs[i])
             valid_actions = [a for a, valid in enumerate(mask) if valid]
             
-            # Application du masque pendant l'inférence epsilon-greedy
             epsilon = cfg["exploration_scheduler"](global_step, TOTAL_TIMESTEPS)
             if np.random.rand() < epsilon:
-                chosen_act = int(np.random.choice(valid_actions))  # <--- int() natif Python ici
+                chosen_act = int(np.random.choice(valid_actions))
             else:
                 with torch.no_grad():
                     q_vals, _ = agents[i].models["q_network"].compute({"states": st_tensor})

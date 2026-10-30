@@ -11,20 +11,20 @@ from skrl.agents.torch.ppo import PPO
 from skrl.memories.torch import RandomMemory
 
 from env.warehouse import Warehouse
-from env.layout import maze_layout
+from env.layout import DEFAULT_MAP, parse
 from rl.policies.mappo_skrl import Actor, Critic, STATE_DIM
 from rl.policies.idqn_skrl import get_state, get_action_mask, N_ACTIONS, OBS_DIM
 
 N_ROBOTS = 2
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-env = Warehouse(layout=maze_layout(42, n_robots=N_ROBOTS), n_robots=N_ROBOTS, max_steps=500)
+env = Warehouse(layout=DEFAULT_MAP, n_robots=N_ROBOTS, max_steps=200)
 obs_space = spaces.Box(low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32)
 state_space = spaces.Box(low=-1.0, high=1.0, shape=(STATE_DIM,), dtype=np.float32)
 act_space = spaces.Discrete(N_ACTIONS)
 
 cfg = PPO.default_config.copy() if hasattr(PPO, "default_config") else {}
-cfg["rollouts"] = 500
+cfg["rollouts"] = 200
 cfg["learning_rate"] = 5e-4
 cfg["mini_batches"] = 4
 cfg["discount_factor"] = 0.99
@@ -40,10 +40,10 @@ for i in range(N_ROBOTS):
     ag.init()
     agents.append(ag)
 
-print("Démarrage entraînement MAPPO avec Action Masking...")
+print("Démarrage entraînement MAPPO sur DEFAULT_MAP avec Action Masking...")
 
 global_step = 0
-TOTAL_TIMESTEPS = 500000
+TOTAL_TIMESTEPS = 80000
 
 def dist_to_target(o):
     if isinstance(o, dict):
@@ -54,7 +54,7 @@ def dist_to_target(o):
         tx, ty = int(o[4]), int(o[5])
     return abs(tx - x) + abs(ty - y)
 
-for episode in range(1200):
+for episode in range(400):
     obs, done = env.reset(seed=42 + episode), False
     while not done:
         states = [get_state(obs[i]) for i in range(N_ROBOTS)]

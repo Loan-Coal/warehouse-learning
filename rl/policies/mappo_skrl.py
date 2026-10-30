@@ -3,14 +3,16 @@ import torch
 import torch.nn as nn
 import numpy as np
 from skrl.models.torch import CategoricalMixin, DeterministicMixin, Model
+
+# Import explicite depuis la version idqn_skrl (11D)
 from rl.policies.idqn_skrl import get_state, get_action_mask, N_ACTIONS, OBS_DIM
 
 N_ROBOTS = 2
-STATE_DIM = OBS_DIM * N_ROBOTS  # 20D (Concaténation des états des 2 robots)
+STATE_DIM = OBS_DIM * N_ROBOTS  # 22D (11D * 2 robots)
 
 
 class Actor(CategoricalMixin, Model):
-    """Réseau de politique (Acteur) : observation locale (10D) -> logits d'actions."""
+    """Réseau de politique (Acteur) : observation locale (11D) -> logits d'actions."""
 
     def __init__(self, observation_space=None, action_space=None, device="cpu"):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -33,7 +35,7 @@ class Actor(CategoricalMixin, Model):
 
 
 class Critic(DeterministicMixin, Model):
-    """Réseau de valeur (Critique Centralisé) : état global joint (20D) -> V(S)."""
+    """Réseau de valeur (Critique Centralisé) : état global joint (22D) -> V(S)."""
 
     def __init__(self, observation_space=None, action_space=None, device="cpu"):
         Model.__init__(self, observation_space=observation_space, action_space=action_space, device=device)
@@ -74,7 +76,6 @@ class SKRLMAPPOPolicy:
             out, _ = self.model.compute({"observations": st_vec})
             logits = out.squeeze(0).clone()
 
-            # Masquage : -1e9 sur les actions physiquement invalides
             for act_idx, is_valid in enumerate(mask):
                 if not is_valid:
                     logits[act_idx] = -1e9
